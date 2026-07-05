@@ -5,7 +5,8 @@ HelloPlanet 是一个 Windows 实时地球/星空壁纸工具。它会从公开�
 ## 下载
 
 - Windows exe: [dist/HelloPlanet.exe](dist/HelloPlanet.exe)
-- Gitee 原始文件下载: https://gitee.com/yinxiaolong007/hello-planet-earth/raw/master/dist/HelloPlanet.exe
+- Gitee exe 下载页: https://gitee.com/yinxiaolong007/hello-planet-earth/blob/master/dist/HelloPlanet.exe
+- 源码压缩包: https://gitee.com/yinxiaolong007/hello-planet-earth/repository/archive/master.zip
 
 ## 功能
 

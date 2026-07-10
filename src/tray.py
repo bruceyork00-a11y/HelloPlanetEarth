@@ -115,11 +115,9 @@ class TrayController:
 	def _title(self) -> str:
 		return f"{APP_NAME} - {self._text('last_update')}: {self._last_update_text()}"
 
-	def _refresh_menu(self):
-		if self._icon:
-			self._icon.title = self._title()
-			self._icon.menu = self._build_menu()
-			self._icon.update_menu()
+	def _label(self, key: str):
+		"""Resolve menu labels when pystray rebuilds the native Windows menu."""
+		return lambda item: self._text(key)
 
 	def set_last_update(self, updated_at: datetime):
 		if self._icon:
@@ -128,7 +126,6 @@ class TrayController:
 	def _safe_call(self, fn: Callable[[], None]):
 		try:
 			fn()
-			self._refresh_menu()
 		except Exception as e:
 			log.error(f"tray action error: {e}")
 
@@ -155,46 +152,46 @@ class TrayController:
 
 	def _build_menu(self) -> pystray.Menu:
 		return pystray.Menu(
-			pystray.MenuItem(self._text("refresh_once"), self._action(self.on_refresh)),
-			pystray.MenuItem(self._text("force_refresh"), self._action(self.on_force_refresh)),
+			pystray.MenuItem(self._label("refresh_once"), self._action(self.on_refresh)),
+			pystray.MenuItem(self._label("force_refresh"), self._action(self.on_force_refresh)),
 			pystray.MenuItem(
-				self._text("mode"),
+				self._label("mode"),
 				pystray.Menu(
 					pystray.MenuItem(
-						self._text("earth"),
+						self._label("earth"),
 						pystray.Menu(
-							pystray.MenuItem(self._text("goes"), self._switch_mode_action("earth"), checked=self._mode_checked("earth"), radio=True),
-							pystray.MenuItem(self._text("asia_2k"), self._switch_mode_action("asia_2k"), checked=self._mode_checked("asia_2k"), radio=True),
-							pystray.MenuItem(self._text("asia_4k"), self._switch_mode_action("asia_4k"), checked=self._mode_checked("asia_4k"), radio=True),
+							pystray.MenuItem(self._label("goes"), self._switch_mode_action("earth"), checked=self._mode_checked("earth"), radio=True),
+							pystray.MenuItem(self._label("asia_2k"), self._switch_mode_action("asia_2k"), checked=self._mode_checked("asia_2k"), radio=True),
+							pystray.MenuItem(self._label("asia_4k"), self._switch_mode_action("asia_4k"), checked=self._mode_checked("asia_4k"), radio=True),
 						),
 					),
 					pystray.MenuItem(
-						self._text("sky"),
+						self._label("sky"),
 						pystray.Menu(
-							pystray.MenuItem(self._text("apod"), self._switch_mode_action("sky"), checked=self._mode_checked("sky"), radio=True),
-							pystray.MenuItem(self._text("sun"), self._switch_mode_action("sun_sdo"), checked=self._mode_checked("sun_sdo"), radio=True),
-							pystray.MenuItem(self._text("mars"), self._switch_mode_action("mars"), checked=self._mode_checked("mars"), radio=True),
+							pystray.MenuItem(self._label("apod"), self._switch_mode_action("sky"), checked=self._mode_checked("sky"), radio=True),
+							pystray.MenuItem(self._label("sun"), self._switch_mode_action("sun_sdo"), checked=self._mode_checked("sun_sdo"), radio=True),
+							pystray.MenuItem(self._label("mars"), self._switch_mode_action("mars"), checked=self._mode_checked("mars"), radio=True),
 						),
 					),
 				),
 			),
 			pystray.MenuItem(
-				self._text("refresh_rate"),
+				self._label("refresh_rate"),
 				pystray.Menu(
-					pystray.MenuItem(self._text("low"), self._set_interval_action(60 * 60), checked=self._interval_checked(60 * 60), radio=True),
-					pystray.MenuItem(self._text("medium"), self._set_interval_action(30 * 60), checked=self._interval_checked(30 * 60), radio=True),
-					pystray.MenuItem(self._text("high"), self._set_interval_action(5 * 60), checked=self._interval_checked(5 * 60), radio=True),
+					pystray.MenuItem(self._label("low"), self._set_interval_action(60 * 60), checked=self._interval_checked(60 * 60), radio=True),
+					pystray.MenuItem(self._label("medium"), self._set_interval_action(30 * 60), checked=self._interval_checked(30 * 60), radio=True),
+					pystray.MenuItem(self._label("high"), self._set_interval_action(5 * 60), checked=self._interval_checked(5 * 60), radio=True),
 				),
 			),
-			pystray.MenuItem(self._text("log_window"), self._action(self.on_toggle_log_window), checked=lambda item: self.is_log_window_open()),
+			pystray.MenuItem(self._label("log_window"), self._action(self.on_toggle_log_window), checked=lambda item: self.is_log_window_open()),
 			pystray.MenuItem(
-				self._text("language"),
+				self._label("language"),
 				pystray.Menu(
-					pystray.MenuItem(self._text("chinese"), self._set_language_action("zh"), checked=self._language_checked("zh"), radio=True),
-					pystray.MenuItem(self._text("english"), self._set_language_action("en"), checked=self._language_checked("en"), radio=True),
+					pystray.MenuItem(self._label("chinese"), self._set_language_action("zh"), checked=self._language_checked("zh"), radio=True),
+					pystray.MenuItem(self._label("english"), self._set_language_action("en"), checked=self._language_checked("en"), radio=True),
 				),
 			),
-			pystray.MenuItem(self._text("quit"), self._action(self.on_quit)),
+			pystray.MenuItem(self._label("quit"), self._action(self.on_quit)),
 		)
 
 	def run(self):

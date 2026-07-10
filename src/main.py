@@ -66,6 +66,7 @@ class Runner:
 		self._wakeup = threading.Event()
 		self._lock = threading.RLock()
 		self._tick_lock = threading.Lock()
+		self._force_refresh_requested = False
 		self._thread = None
 
 	def _tick_once(self, force: bool = False) -> None:
@@ -98,8 +99,11 @@ class Runner:
 	def loop(self):
 		log.info(f"runner start: mode={self.mode} interval={self.interval_seconds}s style={self.style}")
 		while not self._stop.is_set():
+			with self._lock:
+				force = self._force_refresh_requested
+				self._force_refresh_requested = False
 			try:
-				self._tick_once()
+				self._tick_once(force=force)
 			except Exception as e:
 				log.error(f"runner error: {e}")
 			with self._lock:
@@ -119,18 +123,16 @@ class Runner:
 			self._thread.join(timeout=3)
 
 	def refresh_now(self):
-		log.info("manual refresh")
-		try:
-			self._tick_once()
-		except Exception as e:
-			log.error(f"manual refresh error: {e}")
+		"""Schedule a refresh without blocking the Windows tray UI thread."""
+		log.info("manual refresh requested")
+		self._wakeup.set()
 
 	def force_refresh_now(self):
-		log.info("force refresh (ignore cache)")
-		try:
-			self._tick_once(force=True)
-		except Exception as e:
-			log.error(f"force refresh error: {e}")
+		"""Schedule a cache-bypassing refresh without blocking the tray UI."""
+		with self._lock:
+			self._force_refresh_requested = True
+		log.info("force refresh requested")
+		self._wakeup.set()
 
 	def switch_mode(self, new_mode: str):
 		with self._lock:

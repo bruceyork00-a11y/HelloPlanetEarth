@@ -67,6 +67,7 @@ class Runner:
 		self._lock = threading.RLock()
 		self._tick_lock = threading.Lock()
 		self._force_refresh_requested = False
+		self._mode_version = 0
 		self._thread = None
 
 	def _tick_once(self, force: bool = False) -> None:
@@ -74,6 +75,7 @@ class Runner:
 			with self._lock:
 				mode = self.mode
 				style = self.style
+				mode_version = self._mode_version
 			fetch = _fetcher(mode)
 			img = None
 			try:
@@ -81,13 +83,17 @@ class Runner:
 				hashv = md5_of_image(img)
 				last_url, last_hash = read_last()
 				log.info(f"tick: mode={mode} url={url} hash={hashv} last_url={last_url} last_hash={last_hash} force={force}")
-				if not force and last_url == url and last_hash == hashv:
-					log.info("tick: skip same image (url+hash)")
-					return
-				set_wallpaper_from_image(img, style=style)
-				write_last(url, hashv)
-				updated_at = datetime.now()
 				with self._lock:
+					# Do not let an older download overwrite a newly selected mode.
+					if mode_version != self._mode_version:
+						log.info(f"tick: discard stale result for mode={mode}")
+						return
+					if not force and last_url == url and last_hash == hashv:
+						log.info("tick: skip same image (url+hash)")
+						return
+					set_wallpaper_from_image(img, style=style)
+					write_last(url, hashv)
+					updated_at = datetime.now()
 					self.last_update_time = updated_at
 				if self.on_updated:
 					self.on_updated(updated_at)
@@ -122,11 +128,6 @@ class Runner:
 		if self._thread:
 			self._thread.join(timeout=3)
 
-	def refresh_now(self):
-		"""Schedule a refresh without blocking the Windows tray UI thread."""
-		log.info("manual refresh requested")
-		self._wakeup.set()
-
 	def force_refresh_now(self):
 		"""Schedule a cache-bypassing refresh without blocking the tray UI."""
 		with self._lock:
@@ -138,6 +139,10 @@ class Runner:
 		with self._lock:
 			log.info(f"switch mode: {self.mode} -> {new_mode}")
 			self.mode = new_mode
+			self._mode_version += 1
+			self._force_refresh_requested = True
+		log.info(f"mode refresh requested: {new_mode}")
+		self._wakeup.set()
 
 	def set_interval(self, interval_seconds: int):
 		with self._lock:
@@ -168,9 +173,6 @@ def run_with_tray(mode: str, interval_seconds: int, style: str) -> None:
 	setup_logging(os.getenv("LOG_LEVEL", "INFO"), enable_console=False)
 	log.info(f"{APP_NAME} starting...")
 	log_window_process: Optional[subprocess.Popen] = None
-
-	def on_refresh():
-		runner.refresh_now()
 
 	def on_force_refresh():
 		runner.force_refresh_now()
@@ -208,13 +210,12 @@ def run_with_tray(mode: str, interval_seconds: int, style: str) -> None:
 
 	runner = Runner(mode, interval_seconds, style)
 	tray = TrayController(
-		on_refresh=on_refresh,
+		on_force_refresh=on_force_refresh,
 		on_switch_mode=on_switch,
 		on_set_interval=on_set_interval,
 		on_toggle_log_window=on_toggle_log_window,
 		is_log_window_open=is_log_window_open,
 		on_quit=on_quit,
-		on_force_refresh=on_force_refresh,
 		get_mode=runner.get_mode,
 		get_interval=runner.get_interval,
 		get_last_update_time=runner.get_last_update_time,

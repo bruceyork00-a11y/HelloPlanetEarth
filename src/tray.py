@@ -14,7 +14,6 @@ TEXT = {
 	"zh": {
 		"last_update": "上次更新",
 		"not_updated": "尚未更新",
-		"refresh_once": "刷新一次",
 		"force_refresh": "强制刷新",
 		"mode": "模式",
 		"earth": "地球",
@@ -38,7 +37,6 @@ TEXT = {
 	"en": {
 		"last_update": "Last update",
 		"not_updated": "Not updated yet",
-		"refresh_once": "Refresh once",
 		"force_refresh": "Force refresh",
 		"mode": "Mode",
 		"earth": "Earth",
@@ -75,24 +73,22 @@ def _create_icon() -> Image.Image:
 class TrayController:
 	def __init__(
 		self,
-		on_refresh: Callable[[], None],
+		on_force_refresh: Callable[[], None],
 		on_switch_mode: Callable[[str], None],
 		on_set_interval: Callable[[int], None],
 		on_toggle_log_window: Callable[[], None],
 		is_log_window_open: Callable[[], bool],
 		on_quit: Callable[[], None],
-		on_force_refresh: Callable[[], None] = None,
 		get_mode: Callable[[], str] = None,
 		get_interval: Callable[[], int] = None,
 		get_last_update_time: Callable[[], Optional[datetime]] = None,
 	):
-		self.on_refresh = on_refresh
+		self.on_force_refresh = on_force_refresh
 		self.on_switch_mode = on_switch_mode
 		self.on_set_interval = on_set_interval
 		self.on_toggle_log_window = on_toggle_log_window
 		self.is_log_window_open = is_log_window_open
 		self.on_quit = on_quit
-		self.on_force_refresh = on_force_refresh or on_refresh
 		self.get_mode = get_mode or (lambda: "")
 		self.get_interval = get_interval or (lambda: 0)
 		self.get_last_update_time = get_last_update_time or (lambda: None)
@@ -152,7 +148,6 @@ class TrayController:
 
 	def _build_menu(self) -> pystray.Menu:
 		return pystray.Menu(
-			pystray.MenuItem(self._label("refresh_once"), self._action(self.on_refresh)),
 			pystray.MenuItem(self._label("force_refresh"), self._action(self.on_force_refresh)),
 			pystray.MenuItem(
 				self._label("mode"),

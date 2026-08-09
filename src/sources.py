@@ -20,7 +20,7 @@ Image.MAX_IMAGE_PIXELS = 120_000_000
 
 NASA_API_KEY = os.getenv("NASA_API_KEY", "DEMO_KEY")
 
-USER_AGENT = "HelloPlanet/1.2 (+https://anyanygame.com)"
+USER_AGENT = "HelloPlanet/1.2.0 (+https://anyanygame.com)"
 TIMEOUT = 20
 log = logging.getLogger(__name__)
 

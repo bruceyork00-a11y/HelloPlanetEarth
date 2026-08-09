@@ -1,1 +1,2 @@
-5c53d8ad48cfdfbed64ebc4fa11ab336a8c0f58abbacd0963b93f4066d28003e  HelloPlanet.exe
+cceb60fff138c91347069bea85bc68a9556950a144d01575d1d282c2e8bd6b50  HelloPlanet.exe
+d306c2637a2926700960dd36f09cbacd98d01a55de8e83fa7c59fc3445dbec0e  HelloPlanet-v1.1.0-win64.zip

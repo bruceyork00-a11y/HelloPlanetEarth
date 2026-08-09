@@ -4,12 +4,16 @@ import json
 import datetime as dt
 import logging
 import re
+import time
+import concurrent.futures
 from typing import Optional, Tuple
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from PIL import Image
 import certifi
-from requests.exceptions import SSLError
+from requests.exceptions import SSLError, RequestException
 
 # Guard against decompression bombs / malicious oversized images from any source.
 Image.MAX_IMAGE_PIXELS = 120_000_000
@@ -25,21 +29,56 @@ class SourceError(Exception):
 	pass
 
 
-def _download_image(url: str, allow_insecure: bool = False, extra_headers: Optional[dict] = None) -> Image.Image:
+_SESSION: Optional[requests.Session] = None
+
+
+def _get_session() -> requests.Session:
+	global _SESSION
+	if _SESSION is None:
+		s = requests.Session()
+		adapter = HTTPAdapter(
+			pool_connections=25,
+			pool_maxsize=25,
+			max_retries=Retry(
+				total=3,
+				backoff_factor=0.5,
+				status_forcelist=[500, 502, 503, 504],
+				raise_on_status=False,
+			),
+		)
+		s.mount("http://", adapter)
+		s.mount("https://", adapter)
+		s.headers.update({"User-Agent": USER_AGENT, "Cache-Control": "no-cache"})
+		_SESSION = s
+	return _SESSION
+
+
+def _download_image(
+	url: str, allow_insecure: bool = False, extra_headers: Optional[dict] = None, max_retries: int = 3
+) -> Image.Image:
 	headers = {"User-Agent": USER_AGENT, "Cache-Control": "no-cache"}
 	if extra_headers:
 		headers.update(extra_headers)
 	verify_path = False if allow_insecure else certifi.where()
 	if allow_insecure:
 		log.warning("SECURITY: TLS certificate verification DISABLED for this download (ALLOW_INSECURE_*=1)")
-	log.info(f"download start: {url} insecure={allow_insecure}")
-	resp = requests.get(url, headers=headers, timeout=TIMEOUT, verify=verify_path)
-	log.info(f"download response: status={resp.status_code} bytes={len(resp.content)}")
-	resp.raise_for_status()
-	try:
-		return Image.open(io.BytesIO(resp.content))
-	except Image.DecompressionBombError as e:
-		raise SourceError(f"image too large (possible decompression bomb): {url}") from e
+	session = _get_session()
+	last_err = None
+	for attempt in range(max_retries):
+		log.info(f"download start (attempt {attempt+1}/{max_retries}): {url} insecure={allow_insecure}")
+		try:
+			resp = session.get(url, headers=headers, timeout=TIMEOUT, verify=verify_path)
+			log.info(f"download response: status={resp.status_code} bytes={len(resp.content)}")
+			resp.raise_for_status()
+			return Image.open(io.BytesIO(resp.content))
+		except Image.DecompressionBombError as e:
+			raise SourceError(f"image too large (possible decompression bomb): {url}") from e
+		except Exception as e:
+			last_err = e
+			log.warning(f"download attempt {attempt+1} failed for {url}: {e}")
+			if attempt < max_retries - 1:
+				time.sleep(0.5 * (attempt + 1))
+	raise SourceError(f"failed to download image from {url} after {max_retries} attempts: {last_err}")
 
 
 # --- Himawari-8/9 (NICT/Kyoto mirrors) ---
@@ -109,19 +148,44 @@ def _himawari_tile_url(image_template: str, dt_obj: dt.datetime, count: int, x: 
 def _download_himawari_tile_grid(image_template: str, dt_obj: dt.datetime, count: int, allow_insecure: bool = False) -> Image.Image:
 	size = HIMAWARI_TILE_SIZE * count
 	result = Image.new("RGB", (size, size))
+	total_tiles = count * count
+	max_workers = min(12, max(4, count * 2))
+	failed_tiles = []
+
+	def fetch_single_tile(x: int, y: int):
+		url = _himawari_tile_url(image_template, dt_obj, count, x, y)
+		try:
+			tile_img = _download_image(url, allow_insecure=allow_insecure, max_retries=3).convert("RGB")
+			return (x, y, tile_img, None)
+		except Exception as e:
+			log.warning(f"himawari tile({x},{y}) download failed after retries: {e}")
+			return (x, y, None, e)
+
 	try:
-		for tile_y in range(count):
-			for x in range(count):
-				url = _himawari_tile_url(image_template, dt_obj, count, x, tile_y)
-				tile = _download_image(url, allow_insecure=allow_insecure).convert("RGB")
-				try:
-					result.paste(tile, (x * HIMAWARI_TILE_SIZE, tile_y * HIMAWARI_TILE_SIZE))
-				finally:
-					tile.close()
+		with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+			futures = [executor.submit(fetch_single_tile, x, y) for y in range(count) for x in range(count)]
+			for future in concurrent.futures.as_completed(futures):
+				x, y, tile, err = future.result()
+				if tile is not None:
+					try:
+						result.paste(tile, (x * HIMAWARI_TILE_SIZE, y * HIMAWARI_TILE_SIZE))
+					finally:
+						tile.close()
+				else:
+					failed_tiles.append((x, y, err))
 	except Exception:
 		result.close()
 		raise
-	log.info(f"himawari tile grid stitched: count={count} size={result.size}")
+
+	max_allowed_failures = max(1, int(total_tiles * 0.15))
+	if len(failed_tiles) > max_allowed_failures:
+		result.close()
+		raise SourceError(f"himawari tile grid failed: {len(failed_tiles)}/{total_tiles} tiles failed (max allowed: {max_allowed_failures})")
+
+	if failed_tiles:
+		log.warning(f"himawari tile grid stitched with {len(failed_tiles)} missing tiles filled with blank background")
+
+	log.info(f"himawari tile grid stitched successfully: count={count} size={result.size} workers={max_workers}")
 	return result
 
 
@@ -129,10 +193,11 @@ def fetch_himawari_latest(tile_count: Optional[int] = None) -> Tuple[Image.Image
 	allow_insecure_env = os.getenv("ALLOW_INSECURE_HIMAWARI", "0") == "1"
 	tile_count = _himawari_tile_count(tile_count)
 	last_error = None
+	session = _get_session()
 	for name, api_url, image_template in HIMAWARI_SOURCES:
 		log.info(f"himawari query: source={name} url={api_url} tile_count={tile_count} allow_insecure_env={allow_insecure_env}")
 		try:
-			resp = requests.get(api_url, timeout=TIMEOUT, headers={"User-Agent": USER_AGENT}, verify=certifi.where())
+			resp = session.get(api_url, timeout=TIMEOUT, headers={"User-Agent": USER_AGENT}, verify=certifi.where())
 			log.info(f"himawari response: source={name} status={resp.status_code}")
 			resp.raise_for_status()
 			data = resp.json()
@@ -150,7 +215,7 @@ def fetch_himawari_latest(tile_count: Optional[int] = None) -> Tuple[Image.Image
 			if allow_insecure_env:
 				try:
 					log.warning(f"himawari retrying with insecure SSL (verify=False): source={name}")
-					resp = requests.get(api_url, timeout=TIMEOUT, headers={"User-Agent": USER_AGENT}, verify=False)
+					resp = session.get(api_url, timeout=TIMEOUT, headers={"User-Agent": USER_AGENT}, verify=False)
 					log.info(f"himawari response (insecure): source={name} status={resp.status_code}")
 					resp.raise_for_status()
 					data = resp.json()
@@ -188,11 +253,12 @@ JMA_ASIA_SECTORS = [
 
 def fetch_jma_himawari_sector_latest() -> Tuple[Image.Image, str]:
 	last_error = None
+	session = _get_session()
 	for area, element in JMA_ASIA_SECTORS:
 		page_url = JMA_HIMAWARI_PAGE.format(area=area)
 		try:
 			log.info(f"jma himawari sector query: area={area} element={element} url={page_url}")
-			resp = requests.get(page_url, timeout=TIMEOUT, headers={"User-Agent": USER_AGENT}, verify=certifi.where())
+			resp = session.get(page_url, timeout=TIMEOUT, headers={"User-Agent": USER_AGENT}, verify=certifi.where())
 			log.info(f"jma himawari sector response: status={resp.status_code}")
 			resp.raise_for_status()
 			match = re.search(r"<option\s+value=([0-9]{4})>", resp.text)
@@ -235,7 +301,8 @@ EPIC_ARCHIVE = "https://epic.gsfc.nasa.gov/archive/natural/{y}/{m}/{d}/png/{name
 def fetch_epic_latest() -> Tuple[Image.Image, str]:
 	params = {"api_key": NASA_API_KEY}
 	log.info(f"epic query: {EPIC_API} params={params}")
-	resp = requests.get(EPIC_API, params=params, timeout=TIMEOUT, headers={"User-Agent": USER_AGENT}, verify=certifi.where())
+	session = _get_session()
+	resp = session.get(EPIC_API, params=params, timeout=TIMEOUT, headers={"User-Agent": USER_AGENT}, verify=certifi.where())
 	log.info(f"epic response: status={resp.status_code}")
 	resp.raise_for_status()
 	data = resp.json()
@@ -259,7 +326,8 @@ APOD_API = "https://api.nasa.gov/planetary/apod"
 def fetch_apod_image() -> Tuple[Image.Image, str]:
 	params = {"api_key": NASA_API_KEY, "thumbs": "true"}
 	log.info(f"apod query: {APOD_API} params={params}")
-	resp = requests.get(APOD_API, params=params, timeout=TIMEOUT, headers={"User-Agent": USER_AGENT}, verify=certifi.where())
+	session = _get_session()
+	resp = session.get(APOD_API, params=params, timeout=TIMEOUT, headers={"User-Agent": USER_AGENT}, verify=certifi.where())
 	log.info(f"apod response: status={resp.status_code}")
 	resp.raise_for_status()
 	data = resp.json()
@@ -319,11 +387,12 @@ MARS_ROVER_CANDIDATES = [
 
 def fetch_mars_rover_latest() -> Tuple[Image.Image, str]:
 	# Get latest Mars rover photo as alternative space content
+	session = _get_session()
 	for url_template in MARS_ROVER_CANDIDATES:
 		try:
 			url = url_template.format(key=NASA_API_KEY)
 			log.info(f"mars query: {url}")
-			resp = requests.get(url, timeout=TIMEOUT, headers={"User-Agent": USER_AGENT}, verify=certifi.where())
+			resp = session.get(url, timeout=TIMEOUT, headers={"User-Agent": USER_AGENT}, verify=certifi.where())
 			log.info(f"mars response: status={resp.status_code}")
 			resp.raise_for_status()
 			data = resp.json()

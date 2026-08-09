@@ -67,3 +67,9 @@ pyinstaller HelloPlanet.spec --clean --noconfirm
 - Windows 设置壁纸依赖 `SystemParametersInfoW` 和注册表壁纸样式。
 - 亚太 4K 会下载 8x8 个 Himawari 瓦片，刷新会比 2K 慢。
 - 日志和缓存默认写入系统临时目录下的 `hello_planet` 文件夹。
+- 最低系统要求 **Windows 8.1**（exe 由 Python 3.13 构建，不支持 Windows 7/8.0）。
+- 托盘中切换的 **模式 / 刷新频率 / 语言** 现在会持久化到 `%APPDATA%\HelloPlanet\config.json`，重启后保留；命令行参数与 `MODE`/`INTERVAL_SECONDS` 环境变量仅在未保存过配置时作为初始默认值。
+- 仅允许 **单实例** 运行：重复启动会检测到已有实例并自动退出。
+- 机器从睡眠/休眠唤醒后，会**自动强制刷新**一次壁纸（避免停留在旧图）。
+- 未捕获的异常现在会写入日志文件（`hello_planet\app.log`）而非静默崩溃，便于排查。
+- `ALLOW_INSECURE_HIMAWARI` / `ALLOW_INSECURE_SDO=1` 会**关闭 TLS 证书校验**，仅用于源站证书异常时临时排查，存在中间人攻击风险，不建议长期使用。

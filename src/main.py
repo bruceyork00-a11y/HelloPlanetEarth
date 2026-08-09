@@ -21,7 +21,8 @@ from .sources import (
 )
 from .wallpaper import set_wallpaper_from_image
 from .cache import read_last, write_last, md5_of_image
-from .logging_setup import setup_logging, get_log_path
+from .logging_setup import setup_logging, get_log_path, install_crash_handler
+from .config import load_config, save_config, resolve
 from .tray import TrayController
 
 
@@ -34,6 +35,9 @@ REFRESH_INTERVALS = {
 	"medium": 30 * 60,
 	"high": 5 * 60,
 }
+
+# Keep the single-instance mutex alive for the whole process lifetime.
+_INSTANCE_MUTEX = None
 
 
 def _fetcher(mode: str) -> Callable[[], Tuple[Image.Image, str]]:
@@ -104,14 +108,22 @@ class Runner:
 
 	def loop(self):
 		log.info(f"runner start: mode={self.mode} interval={self.interval_seconds}s style={self.style}")
+		last_start = time.monotonic()
 		while not self._stop.is_set():
 			with self._lock:
+				interval_seconds = self.interval_seconds
 				force = self._force_refresh_requested
 				self._force_refresh_requested = False
+			# Detect a long gap (machine slept/woken): the wallpaper is now stale.
+			now = time.monotonic()
+			if now - last_start > interval_seconds + 300:
+				log.info("loop: long gap (sleep/wake?) detected, forcing refresh")
+				force = True
 			try:
 				self._tick_once(force=force)
 			except Exception as e:
 				log.error(f"runner error: {e}")
+			last_start = time.monotonic()
 			with self._lock:
 				interval_seconds = self.interval_seconds
 			self._wakeup.wait(interval_seconds)
@@ -172,6 +184,9 @@ class Runner:
 def run_with_tray(mode: str, interval_seconds: int, style: str) -> None:
 	setup_logging(os.getenv("LOG_LEVEL", "INFO"), enable_console=False)
 	log.info(f"{APP_NAME} starting...")
+	cfg = load_config()
+	# On first run (no saved config), still honor the HELLOPLANET_LANG env var.
+	initial_language = cfg.get("language") if cfg.get("_loaded") else None
 	log_window_process: Optional[subprocess.Popen] = None
 
 	def on_force_refresh():
@@ -179,9 +194,17 @@ def run_with_tray(mode: str, interval_seconds: int, style: str) -> None:
 
 	def on_switch(new_mode: str):
 		runner.switch_mode(new_mode)
+		cfg["mode"] = new_mode
+		save_config(cfg)
 
 	def on_set_interval(interval: int):
 		runner.set_interval(interval)
+		cfg["interval"] = interval
+		save_config(cfg)
+
+	def on_set_language(language: str):
+		cfg["language"] = language
+		save_config(cfg)
 
 	def is_log_window_open() -> bool:
 		nonlocal log_window_process
@@ -214,8 +237,10 @@ def run_with_tray(mode: str, interval_seconds: int, style: str) -> None:
 		on_switch_mode=on_switch,
 		on_set_interval=on_set_interval,
 		on_toggle_log_window=on_toggle_log_window,
+		on_set_language=on_set_language,
 		is_log_window_open=is_log_window_open,
 		on_quit=on_quit,
+		initial_language=initial_language,
 		get_mode=runner.get_mode,
 		get_interval=runner.get_interval,
 		get_last_update_time=runner.get_last_update_time,
@@ -230,21 +255,51 @@ def parse_args(argv: list) -> argparse.Namespace:
 	parser.add_argument(
 		"--mode",
 		choices=["earth", "asia", "asia_2k", "asia_4k", "asia_custom", "sky", "sun_sdo", "mars"],
-		default=os.getenv("MODE", "earth"),
+		default=None,
 	)
-	parser.add_argument("--interval", type=int, default=int(os.getenv("INTERVAL_SECONDS", str(DEFAULT_INTERVAL_SECONDS))))
-	parser.add_argument("--style", choices=["center", "stretch", "fit", "fill", "tile"], default="fill")
+	parser.add_argument("--interval", type=int, default=None)
+	parser.add_argument("--style", choices=["center", "stretch", "fit", "fill", "tile"], default=None)
 	parser.add_argument("--no-tray", action="store_true", help="禁用系统托盘，仅控制台运行")
 	parser.add_argument("--log-level", default=os.getenv("LOG_LEVEL", "INFO"))
 	return parser.parse_args(argv)
 
 
+def _ensure_single_instance() -> bool:
+	"""Return True if this process may continue, False if another instance owns
+	the mutex. Windows-only; other platforms always allow."""
+	global _INSTANCE_MUTEX
+	if sys.platform != "win32":
+		return True
+	try:
+		import ctypes
+		kernel32 = ctypes.windll.kernel32
+		user = os.getenv("USERNAME", "default")
+		name = "Local\\HelloPlanet_Instance_" + "".join(c if c.isalnum() else "_" for c in user)
+		handle = kernel32.CreateMutexW(None, False, name)
+		if not handle:
+			return True
+		_INSTANCE_MUTEX = handle
+		if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+			return False
+		return True
+	except Exception as e:
+		log.warning(f"single-instance check failed (proceeding): {e}")
+		return True
+
+
 def main(argv: list) -> int:
+	install_crash_handler()
 	args = parse_args(argv)
+	if not _ensure_single_instance():
+		log.warning("another HelloPlanet instance is already running; exiting")
+		return 1
+	mode = resolve(args.mode, "mode", "MODE")
+	interval = int(resolve(args.interval, "interval", "INTERVAL_SECONDS") or DEFAULT_INTERVAL_SECONDS)
+	style = resolve(args.style, "style")
 	if args.no_tray:
 		setup_logging(args.log_level, enable_console=True)
 		log.info("console-only mode")
-		runner = Runner(args.mode, args.interval, args.style)
+		runner = Runner(mode, interval, style)
 		runner.start()
 		try:
 			while True:
@@ -253,7 +308,7 @@ def main(argv: list) -> int:
 			log.info("keyboard interrupt")
 			runner.stop()
 	else:
-		run_with_tray(args.mode, args.interval, args.style)
+		run_with_tray(mode, interval, style)
 	return 0
 
 

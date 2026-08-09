@@ -1,5 +1,8 @@
 import logging
 import os
+import sys
+import threading
+import traceback
 import tempfile
 from logging.handlers import RotatingFileHandler
 
@@ -39,4 +42,33 @@ def setup_logging(level: str = "INFO", enable_console: bool = True) -> None:
 	fh.setLevel(numeric_level)
 	fh.setFormatter(formatter)
 	logger.addHandler(fh)
+
+
+def install_crash_handler() -> None:
+	"""Install last-resort handlers so an unhandled exception is recorded to the
+	log file instead of silently vanishing (the tray icon just disappears)."""
+	log_path = get_log_path()
+
+	def _emit(exc_type, exc, tb):
+		try:
+			logging.getLogger().critical("unhandled exception, app exiting", exc_info=(exc_type, exc, tb))
+		except Exception:
+			pass
+		try:
+			with open(log_path, "a", encoding="utf-8") as f:
+				traceback.print_exception(exc_type, exc, tb, file=f)
+		except Exception:
+			pass
+
+	def _excepthook(exc_type, exc, tb):
+		_emit(exc_type, exc, tb)
+		# Let a hard crash still produce a visible error via stderr as a fallback.
+		traceback.print_exception(exc_type, exc, tb)
+
+	def _threading_excepthook(args):
+		# Called for exceptions in threads other than the main thread.
+		_emit(args.exc_type, args.exc_value, args.exc_traceback)
+
+	sys.excepthook = _excepthook
+	threading.excepthook = _threading_excepthook
 

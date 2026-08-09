@@ -79,6 +79,8 @@ class TrayController:
 		on_toggle_log_window: Callable[[], None],
 		is_log_window_open: Callable[[], bool],
 		on_quit: Callable[[], None],
+		on_set_language: Callable[[str], None] = None,
+		initial_language: str = "zh",
 		get_mode: Callable[[], str] = None,
 		get_interval: Callable[[], int] = None,
 		get_last_update_time: Callable[[], Optional[datetime]] = None,
@@ -89,10 +91,11 @@ class TrayController:
 		self.on_toggle_log_window = on_toggle_log_window
 		self.is_log_window_open = is_log_window_open
 		self.on_quit = on_quit
+		self.on_set_language = on_set_language
 		self.get_mode = get_mode or (lambda: "")
 		self.get_interval = get_interval or (lambda: 0)
 		self.get_last_update_time = get_last_update_time or (lambda: None)
-		self.language = self._normalize_language(os.getenv("HELLOPLANET_LANG", "zh"))
+		self.language = self._normalize_language(initial_language or os.getenv("HELLOPLANET_LANG", "zh"))
 		self._icon = None
 
 	def _normalize_language(self, language: str) -> str:
@@ -135,7 +138,12 @@ class TrayController:
 		return self._action(lambda: self.on_set_interval(interval_seconds))
 
 	def _set_language_action(self, language: str):
-		return self._action(lambda: setattr(self, "language", self._normalize_language(language)))
+		lang = self._normalize_language(language)
+		def _fn():
+			self.language = lang
+			if self.on_set_language:
+				self.on_set_language(lang)
+		return self._action(_fn)
 
 	def _mode_checked(self, mode: str):
 		return lambda item: self.get_mode() == mode or (mode == "asia_2k" and self.get_mode() == "asia")

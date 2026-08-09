@@ -11,9 +11,12 @@ from PIL import Image
 import certifi
 from requests.exceptions import SSLError
 
+# Guard against decompression bombs / malicious oversized images from any source.
+Image.MAX_IMAGE_PIXELS = 120_000_000
+
 NASA_API_KEY = os.getenv("NASA_API_KEY", "DEMO_KEY")
 
-USER_AGENT = "HelloPlanet/1.2 (+https://example.local)"
+USER_AGENT = "HelloPlanet/1.2 (+https://anyanygame.com)"
 TIMEOUT = 20
 log = logging.getLogger(__name__)
 
@@ -27,11 +30,16 @@ def _download_image(url: str, allow_insecure: bool = False, extra_headers: Optio
 	if extra_headers:
 		headers.update(extra_headers)
 	verify_path = False if allow_insecure else certifi.where()
+	if allow_insecure:
+		log.warning("SECURITY: TLS certificate verification DISABLED for this download (ALLOW_INSECURE_*=1)")
 	log.info(f"download start: {url} insecure={allow_insecure}")
 	resp = requests.get(url, headers=headers, timeout=TIMEOUT, verify=verify_path)
 	log.info(f"download response: status={resp.status_code} bytes={len(resp.content)}")
 	resp.raise_for_status()
-	return Image.open(io.BytesIO(resp.content))
+	try:
+		return Image.open(io.BytesIO(resp.content))
+	except Image.DecompressionBombError as e:
+		raise SourceError(f"image too large (possible decompression bomb): {url}") from e
 
 
 # --- Himawari-8/9 (NICT/Kyoto mirrors) ---
@@ -101,14 +109,18 @@ def _himawari_tile_url(image_template: str, dt_obj: dt.datetime, count: int, x: 
 def _download_himawari_tile_grid(image_template: str, dt_obj: dt.datetime, count: int, allow_insecure: bool = False) -> Image.Image:
 	size = HIMAWARI_TILE_SIZE * count
 	result = Image.new("RGB", (size, size))
-	for tile_y in range(count):
-		for x in range(count):
-			url = _himawari_tile_url(image_template, dt_obj, count, x, tile_y)
-			tile = _download_image(url, allow_insecure=allow_insecure).convert("RGB")
-			try:
-				result.paste(tile, (x * HIMAWARI_TILE_SIZE, tile_y * HIMAWARI_TILE_SIZE))
-			finally:
-				tile.close()
+	try:
+		for tile_y in range(count):
+			for x in range(count):
+				url = _himawari_tile_url(image_template, dt_obj, count, x, tile_y)
+				tile = _download_image(url, allow_insecure=allow_insecure).convert("RGB")
+				try:
+					result.paste(tile, (x * HIMAWARI_TILE_SIZE, tile_y * HIMAWARI_TILE_SIZE))
+				finally:
+					tile.close()
+	except Exception:
+		result.close()
+		raise
 	log.info(f"himawari tile grid stitched: count={count} size={result.size}")
 	return result
 

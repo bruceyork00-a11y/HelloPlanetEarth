@@ -37,9 +37,9 @@ def _set_style_in_registry(style: str) -> None:
 
 def _save_as_bmp(image: Image.Image, target_path: str) -> str:
 	os.makedirs(os.path.dirname(target_path), exist_ok=True)
-	rgb_image = image.convert("RGB")
-	rgb_image.save(target_path, format="BMP")
-	log.info(f"bmp saved: path={target_path} size={rgb_image.size}")
+	with image.convert("RGB") as rgb_image:
+		rgb_image.save(target_path, format="BMP")
+		log.info(f"bmp saved: path={target_path} size={rgb_image.size}")
 	return target_path
 
 

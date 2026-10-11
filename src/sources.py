@@ -1,517 +1,431 @@
-import os
+"""Public imagery providers. Fallbacks preserve the selected satellite."""
+import concurrent.futures
+import datetime as dt
 import io
 import json
-import datetime as dt
 import logging
+import os
 import re
+import threading
 import time
-import concurrent.futures
-from typing import Optional, Tuple
+from email.utils import parsedate_to_datetime
+from contextlib import contextmanager
+from urllib.parse import urljoin, urlencode
 
 import requests
 from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-from PIL import Image
-import certifi
-from requests.exceptions import SSLError, RequestException
+from PIL import Image, ImageChops
 
-# Guard against decompression bombs / malicious oversized images from any source.
 Image.MAX_IMAGE_PIXELS = 120_000_000
-
-NASA_API_KEY = os.getenv("NASA_API_KEY", "DEMO_KEY")
-
-USER_AGENT = "HelloPlanet/1.2.0 (+https://anyanygame.com)"
-TIMEOUT = 20
+USER_AGENT = "HelloPlanet/1.3.0 (+https://gitee.com/yinxiaolong007/hello-planet-earth)"
+TIMEOUT = (8, 20)
+MAX_BYTES = 48 * 1024 * 1024
+MAX_SATELLITE_AGE = dt.timedelta(hours=3)
 log = logging.getLogger(__name__)
+_local = threading.local()
 
 
 class SourceError(Exception):
-	pass
+    pass
 
 
-_SESSION: Optional[requests.Session] = None
+class DownloadCancelled(SourceError):
+    pass
 
 
-def _get_session() -> requests.Session:
-	global _SESSION
-	if _SESSION is None:
-		s = requests.Session()
-		adapter = HTTPAdapter(
-			pool_connections=25,
-			pool_maxsize=25,
-			max_retries=Retry(
-				total=3,
-				backoff_factor=0.5,
-				status_forcelist=[500, 502, 503, 504],
-				raise_on_status=False,
-			),
-		)
-		s.mount("http://", adapter)
-		s.mount("https://", adapter)
-		s.headers.update({"User-Agent": USER_AGENT, "Cache-Control": "no-cache"})
-		_SESSION = s
-	return _SESSION
+@contextmanager
+def download_scope(stop_event):
+    previous = getattr(_local, "stop_event", None)
+    _local.stop_event = stop_event
+    try:
+        yield
+    finally:
+        _local.stop_event = previous
 
 
-def _download_image(
-	url: str, allow_insecure: bool = False, extra_headers: Optional[dict] = None, max_retries: int = 3
-) -> Image.Image:
-	headers = {"User-Agent": USER_AGENT, "Cache-Control": "no-cache"}
-	if extra_headers:
-		headers.update(extra_headers)
-	verify_path = False if allow_insecure else certifi.where()
-	if allow_insecure:
-		log.warning("SECURITY: TLS certificate verification DISABLED for this download (ALLOW_INSECURE_*=1)")
-	session = _get_session()
-	last_err = None
-	for attempt in range(max_retries):
-		log.info(f"download start (attempt {attempt+1}/{max_retries}): {url} insecure={allow_insecure}")
-		try:
-			resp = session.get(url, headers=headers, timeout=TIMEOUT, verify=verify_path)
-			log.info(f"download response: status={resp.status_code} bytes={len(resp.content)}")
-			resp.raise_for_status()
-			return Image.open(io.BytesIO(resp.content))
-		except Image.DecompressionBombError as e:
-			raise SourceError(f"image too large (possible decompression bomb): {url}") from e
-		except Exception as e:
-			last_err = e
-			log.warning(f"download attempt {attempt+1} failed for {url}: {e}")
-			if attempt < max_retries - 1:
-				time.sleep(0.5 * (attempt + 1))
-	raise SourceError(f"failed to download image from {url} after {max_retries} attempts: {last_err}")
+def _check_cancelled():
+    event = getattr(_local, "stop_event", None)
+    if event is not None and event.is_set():
+        raise DownloadCancelled("Download cancelled on application shutdown")
 
 
-# --- Himawari-8/9 (NICT/Kyoto mirrors) ---
-# D531106 is the full-disk visible composite used by the real-time Himawari web
-# viewer. The public mirrors share the same latest.json and tile path layout.
+def _get_session():
+    # Sessions have mutable cookies; give each worker its own reusable pool.
+    if not hasattr(_local, "session"):
+        session = requests.Session()
+        session.mount("https://", HTTPAdapter(pool_connections=8, pool_maxsize=8, max_retries=0))
+        session.headers.update({"User-Agent": USER_AGENT, "Cache-Control": "no-cache"})
+        _local.session = session
+    return _local.session
+
+
+def _request(url, max_bytes=MAX_BYTES):
+    _check_cancelled()
+    start = time.monotonic()
+    with _get_session().get(url, timeout=TIMEOUT, stream=True) as response:
+        response.raise_for_status()
+        if not response.url.startswith("https://"):
+            raise SourceError("Provider redirected to an insecure URL")
+        if int(response.headers.get("Content-Length", "0")) > max_bytes:
+            raise SourceError("Response exceeds download size limit")
+        chunks, size = [], 0
+        for chunk in response.iter_content(64 * 1024):
+            _check_cancelled()
+            size += len(chunk)
+            if size > max_bytes or time.monotonic() - start > 60:
+                raise SourceError("Download exceeded size or duration limit")
+            chunks.append(chunk)
+        return b"".join(chunks), dict(response.headers)
+
+
+def _json(url):
+    for attempt in range(2):
+        try:
+            body, _ = _request(url, max_bytes=8 * 1024 * 1024)
+            break
+        except requests.HTTPError as error:
+            if attempt or error.response is None or error.response.status_code < 500:
+                raise
+        except requests.RequestException:
+            if attempt:
+                raise
+        time.sleep(0.25)
+    try:
+        return json.loads(body)
+    except (ValueError, UnicodeError) as error:
+        raise SourceError("Provider did not return valid JSON") from error
+
+
+def _fresh(timestamp, max_age=MAX_SATELLITE_AGE):
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=dt.timezone.utc)
+    age = dt.datetime.now(dt.timezone.utc) - timestamp
+    if age > max_age or age < -dt.timedelta(minutes=30):
+        raise SourceError(f"Stale or invalid observation timestamp: {timestamp.isoformat()}")
+
+
+def _download_image(url, max_retries=2, max_age=None, min_size=1):
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            body, headers = _request(url)
+            if max_age and headers.get("Last-Modified"):
+                _fresh(parsedate_to_datetime(headers["Last-Modified"]), max_age)
+            with Image.open(io.BytesIO(body)) as original:
+                original.load()
+                if min(original.size) < min_size:
+                    raise SourceError(f"Image resolution too small: {original.size}")
+                image = original.convert("RGB")
+            image.info.update(source_url=url, last_modified=headers.get("Last-Modified"))
+            return image
+        except requests.HTTPError as error:
+            last_error = error
+            if error.response is not None and error.response.status_code < 500:
+                break
+        except DownloadCancelled:
+            raise
+        except (SourceError, Image.DecompressionBombError, Image.DecompressionBombWarning) as error:
+            raise SourceError(str(error)) from error
+        except (requests.RequestException, OSError, ValueError) as error:
+            last_error = error
+        if attempt + 1 < max_retries:
+            time.sleep(0.25)
+    raise SourceError(f"Image download failed: {url}: {last_error}")
+
+
+def _best_effort(providers):
+    errors = []
+    for name, fetch in providers:
+        try:
+            image, url = fetch()
+            image.info["provider"] = name
+            log.info("source success: %s size=%s url=%s", name, image.size, url)
+            return image, url
+        except DownloadCancelled:
+            raise
+        except Exception as error:
+            log.warning("source failed: %s: %s", name, error)
+            errors.append(f"{name}: {error}")
+    raise SourceError("No matching provider available: " + "; ".join(errors))
+
 
 HIMAWARI_TILE_SIZE = 550
 HIMAWARI_DEFAULT_TILE_COUNT = 4
-HIMAWARI_ALLOWED_TILE_COUNTS = {1, 2, 4, 8, 16, 20}
-
+HIMAWARI_ALLOWED_TILE_COUNTS = {1, 2, 4, 8, 16}
 HIMAWARI_SOURCES = [
-	(
-		"himawari.asia web / Kyoto tiles",
-		"https://himawari.asia/img/D531106/latest.json",
-		"https://jh190005-4.kudpc.kyoto-u.ac.jp/himawari/img/D531106/{count}d/550/{y}/{m}/{d}/{h}{mi}{s}_{x}_{tile_y}.png",
-	),
-	(
-		"Kyoto Himawari mirror",
-		"https://jh190005-4.kudpc.kyoto-u.ac.jp/himawari/img/D531106/latest.json",
-		"https://jh190005-4.kudpc.kyoto-u.ac.jp/himawari/img/D531106/{count}d/550/{y}/{m}/{d}/{h}{mi}{s}_{x}_{tile_y}.png",
-	),
-	(
-		"himawari.asia direct",
-		"https://himawari.asia/img/D531106/latest.json",
-		"https://himawari.asia/img/D531106/{count}d/550/{y}/{m}/{d}/{h}{mi}{s}_{x}_{tile_y}.png",
-	),
-	(
-		"NICT",
-		"https://himawari8.nict.go.jp/img/D531106/latest.json",
-		"https://himawari8.nict.go.jp/img/D531106/{count}d/550/{y}/{m}/{d}/{h}{mi}{s}_{x}_{tile_y}.png",
-	),
-	(
-		"NICT download mirror",
-		"https://himawari8-dl.nict.go.jp/himawari8/img/D531106/latest.json",
-		"https://himawari8-dl.nict.go.jp/himawari8/img/D531106/{count}d/550/{y}/{m}/{d}/{h}{mi}{s}_{x}_{tile_y}.png",
-	),
+    ("Kyoto", "https://jh190005-4.kudpc.kyoto-u.ac.jp/himawari/img/D531106/latest.json",
+     "https://jh190005-4.kudpc.kyoto-u.ac.jp/himawari/img/D531106/{count}d/550/{y}/{m}/{d}/{h}{mi}{s}_{x}_{tile_y}.png"),
+    ("himawari.asia", "https://himawari.asia/img/D531106/latest.json",
+     "https://himawari.asia/img/D531106/{count}d/550/{y}/{m}/{d}/{h}{mi}{s}_{x}_{tile_y}.png"),
+    ("NICT download", "https://himawari8-dl.nict.go.jp/himawari8/img/D531106/latest.json",
+     "https://himawari8-dl.nict.go.jp/himawari8/img/D531106/{count}d/550/{y}/{m}/{d}/{h}{mi}{s}_{x}_{tile_y}.png"),
+    ("NICT", "https://himawari8.nict.go.jp/img/D531106/latest.json",
+     "https://himawari8.nict.go.jp/img/D531106/{count}d/550/{y}/{m}/{d}/{h}{mi}{s}_{x}_{tile_y}.png"),
 ]
 
 
-def _himawari_tile_count(preferred_count: Optional[int] = None) -> int:
-	raw_count = str(preferred_count) if preferred_count is not None else os.getenv("HIMAWARI_TILE_COUNT", str(HIMAWARI_DEFAULT_TILE_COUNT))
-	try:
-		count = int(raw_count)
-	except ValueError:
-		log.warning(f"invalid HIMAWARI_TILE_COUNT={raw_count!r}, using {HIMAWARI_DEFAULT_TILE_COUNT}")
-		return HIMAWARI_DEFAULT_TILE_COUNT
-	if count not in HIMAWARI_ALLOWED_TILE_COUNTS:
-		log.warning(f"unsupported HIMAWARI_TILE_COUNT={count}, using {HIMAWARI_DEFAULT_TILE_COUNT}")
-		return HIMAWARI_DEFAULT_TILE_COUNT
-	return count
+def _himawari_tile_count(preferred_count=None):
+    try:
+        count = int(preferred_count if preferred_count is not None else
+                    os.getenv("HIMAWARI_TILE_COUNT", HIMAWARI_DEFAULT_TILE_COUNT))
+    except (TypeError, ValueError):
+        count = HIMAWARI_DEFAULT_TILE_COUNT
+    return count if count in HIMAWARI_ALLOWED_TILE_COUNTS else HIMAWARI_DEFAULT_TILE_COUNT
 
 
-def _himawari_tile_url(image_template: str, dt_obj: dt.datetime, count: int, x: int, y: int) -> str:
-	return image_template.format(
-		count=count,
-		y=dt_obj.strftime("%Y"),
-		m=dt_obj.strftime("%m"),
-		d=dt_obj.strftime("%d"),
-		h=dt_obj.strftime("%H"),
-		mi=dt_obj.strftime("%M"),
-		s=dt_obj.strftime("%S"),
-		x=x,
-		tile_y=y,
-	)
+def _himawari_tile_url(template, timestamp, count, x, y):
+    return template.format(count=count, y=timestamp.strftime("%Y"), m=timestamp.strftime("%m"),
+                           d=timestamp.strftime("%d"), h=timestamp.strftime("%H"),
+                           mi=timestamp.strftime("%M"), s=timestamp.strftime("%S"), x=x, tile_y=y)
 
 
-def _download_himawari_tile_grid(image_template: str, dt_obj: dt.datetime, count: int, allow_insecure: bool = False) -> Image.Image:
-	size = HIMAWARI_TILE_SIZE * count
-	result = Image.new("RGB", (size, size))
-	total_tiles = count * count
-	max_workers = min(12, max(4, count * 2))
-	failed_tiles = []
-
-	def fetch_single_tile(x: int, y: int):
-		url = _himawari_tile_url(image_template, dt_obj, count, x, y)
-		try:
-			tile_img = _download_image(url, allow_insecure=allow_insecure, max_retries=3).convert("RGB")
-			return (x, y, tile_img, None)
-		except Exception as e:
-			log.warning(f"himawari tile({x},{y}) download failed after retries: {e}")
-			return (x, y, None, e)
-
-	try:
-		with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-			futures = [executor.submit(fetch_single_tile, x, y) for y in range(count) for x in range(count)]
-			for future in concurrent.futures.as_completed(futures):
-				x, y, tile, err = future.result()
-				if tile is not None:
-					try:
-						result.paste(tile, (x * HIMAWARI_TILE_SIZE, y * HIMAWARI_TILE_SIZE))
-					finally:
-						tile.close()
-				else:
-					failed_tiles.append((x, y, err))
-	except Exception:
-		result.close()
-		raise
-
-	max_allowed_failures = max(1, int(total_tiles * 0.15))
-	if len(failed_tiles) > max_allowed_failures:
-		result.close()
-		raise SourceError(f"himawari tile grid failed: {len(failed_tiles)}/{total_tiles} tiles failed (max allowed: {max_allowed_failures})")
-
-	if failed_tiles:
-		log.warning(f"himawari tile grid stitched with {len(failed_tiles)} missing tiles filled with blank background")
-
-	log.info(f"himawari tile grid stitched successfully: count={count} size={result.size} workers={max_workers}")
-	return result
+def _tile_grid(url_for_tile, count, tile_size):
+    result = Image.new("RGB", (count * tile_size, count * tile_size))
+    futures = {}
+    stop_event = getattr(_local, "stop_event", None)
+    def fetch_tile(url):
+        with download_scope(stop_event):
+            return _download_image(url)
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, count * count)) as pool:
+            futures = {pool.submit(fetch_tile, url_for_tile(x, y)): (x, y)
+                       for y in range(count) for x in range(count)}
+            for future in concurrent.futures.as_completed(futures):
+                x, y = futures[future]
+                try:
+                    with future.result() as tile:
+                        if tile.size != (tile_size, tile_size):
+                            raise SourceError(f"Unexpected tile size: {tile.size}")
+                        result.paste(tile, (x * tile_size, y * tile_size))
+                except Exception as error:
+                    for pending in futures:
+                        pending.cancel()
+                    if isinstance(error, DownloadCancelled):
+                        raise
+                    raise SourceError(f"Incomplete tile grid at ({x},{y}): {error}") from error
+        return result
+    except BaseException:
+        result.close()
+        for future in futures:
+            if future.done() and not future.cancelled() and future.exception() is None:
+                future.result().close()
+        raise
 
 
-def fetch_himawari_latest(tile_count: Optional[int] = None) -> Tuple[Image.Image, str]:
-	allow_insecure_env = os.getenv("ALLOW_INSECURE_HIMAWARI", "0") == "1"
-	tile_count = _himawari_tile_count(tile_count)
-	last_error = None
-	session = _get_session()
-	for name, api_url, image_template in HIMAWARI_SOURCES:
-		log.info(f"himawari query: source={name} url={api_url} tile_count={tile_count} allow_insecure_env={allow_insecure_env}")
-		try:
-			resp = session.get(api_url, timeout=TIMEOUT, headers={"User-Agent": USER_AGENT}, verify=certifi.where())
-			log.info(f"himawari response: source={name} status={resp.status_code}")
-			resp.raise_for_status()
-			data = resp.json()
-			date_str = data.get("date")
-			if not date_str:
-				raise SourceError("Himawari latest.json missing 'date'")
-			log.info(f"himawari latest: source={name} date={date_str}")
-			dt_obj = dt.datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
-			img = _download_himawari_tile_grid(image_template, dt_obj, tile_count)
-			url = _himawari_tile_url(image_template, dt_obj, tile_count, 0, 0)
-			return img, f"{url}#stitched-{tile_count}d"
-		except SSLError as e:
-			log.warning(f"himawari SSL error (secure): source={name} error={e}")
-			last_error = e
-			if allow_insecure_env:
-				try:
-					log.warning(f"himawari retrying with insecure SSL (verify=False): source={name}")
-					resp = session.get(api_url, timeout=TIMEOUT, headers={"User-Agent": USER_AGENT}, verify=False)
-					log.info(f"himawari response (insecure): source={name} status={resp.status_code}")
-					resp.raise_for_status()
-					data = resp.json()
-					date_str = data.get("date")
-					if not date_str:
-						raise SourceError("Himawari latest.json missing 'date'")
-					log.info(f"himawari latest (insecure): source={name} date={date_str}")
-					dt_obj = dt.datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
-					img = _download_himawari_tile_grid(image_template, dt_obj, tile_count, allow_insecure=True)
-					url = _himawari_tile_url(image_template, dt_obj, tile_count, 0, 0)
-					return img, f"{url}#stitched-{tile_count}d"
-				except Exception as ie:
-					log.error(f"himawari insecure fetch failed: source={name} error={ie}")
-					last_error = ie
-		except Exception as e:
-			log.warning(f"himawari failed: source={name} url={api_url} error={e}")
-			last_error = e
-	if last_error:
-		raise SourceError(f"Himawari failed: {last_error}")
-	raise SourceError("Himawari unknown failure")
+def _fetch_himawari_source(source, count):
+    _, api, template = source
+    stamp = dt.datetime.strptime(_json(api)["date"], "%Y-%m-%d %H:%M:%S")
+    _fresh(stamp)
+    image = _tile_grid(lambda x, y: _himawari_tile_url(template, stamp, count, x, y),
+                       count, HIMAWARI_TILE_SIZE)
+    image.info["observed_at_utc"] = stamp.isoformat() + "Z"
+    return image, _himawari_tile_url(template, stamp, count, 0, 0) + f"#stitched-{count}d"
 
 
-# --- JMA Himawari Real-Time Image sectors ---
-JMA_HIMAWARI_BASE = "https://www.data.jma.go.jp/mscweb/data/himawari/"
-JMA_HIMAWARI_PAGE = JMA_HIMAWARI_BASE + "sat_img.php?area={area}"
-JMA_ASIA_SECTORS = [
-	# True Color Reproduction imagery. se2 is centered on East/Southeast Asia.
-	("se2", "trm"),
-	("se3", "trm"),
-	("se1", "trm"),
-	("se4", "trm"),
-	("ca1", "trm"),
-]
+def fetch_himawari_latest(tile_count=None):
+    count = _himawari_tile_count(tile_count)
+    return _best_effort([(source[0], lambda source=source: _fetch_himawari_source(source, count))
+                         for source in HIMAWARI_SOURCES])
 
 
-def fetch_jma_himawari_sector_latest() -> Tuple[Image.Image, str]:
-	last_error = None
-	session = _get_session()
-	for area, element in JMA_ASIA_SECTORS:
-		page_url = JMA_HIMAWARI_PAGE.format(area=area)
-		try:
-			log.info(f"jma himawari sector query: area={area} element={element} url={page_url}")
-			resp = session.get(page_url, timeout=TIMEOUT, headers={"User-Agent": USER_AGENT}, verify=certifi.where())
-			log.info(f"jma himawari sector response: status={resp.status_code}")
-			resp.raise_for_status()
-			match = re.search(r"<option\s+value=([0-9]{4})>", resp.text)
-			if not match:
-				raise SourceError(f"JMA sector page missing latest time option: area={area}")
-			time_code = match.group(1)
-			url = f"{JMA_HIMAWARI_BASE}img/{area}/{area}_{element}_{time_code}.jpg"
-			img = _download_image(url)
-			log.info(f"jma himawari sector success: area={area} time={time_code} url={url} size={img.size}")
-			return img, url
-		except Exception as e:
-			log.warning(f"jma himawari sector failed: area={area} error={e}")
-			last_error = e
-	if last_error:
-		raise SourceError(f"JMA Himawari sectors failed: {last_error}")
-	raise SourceError("JMA Himawari sectors unknown failure")
+SLIDER_BASE = "https://slider.cira.colostate.edu/data/"
+SLIDER_TILE_SIZES = {"himawari": 688, "gk2a": 688, "goes-19": 678, "goes-18": 678}
 
 
-# --- GOES-16 GeoColor full-disk (NESDIS CDN) ---
-GOES16_BASE = "https://cdn.star.nesdis.noaa.gov/GOES16/ABI/FD/GEOCOLOR/latest.jpg"
+def fetch_slider_latest(satellite="himawari", count=4):
+    if count not in {1, 2, 4, 8, 16}:
+        raise SourceError("Unsupported CIRA tile count")
+    times = _json(f"{SLIDER_BASE}json/{satellite}/full_disk/geocolor/latest_times.json").get("timestamps_int", [])
+    if not times:
+        raise SourceError("CIRA returned no observation timestamps")
+    errors = []
+    for raw_stamp in sorted(times, reverse=True)[:2]:
+        stamp = dt.datetime.strptime(str(raw_stamp), "%Y%m%d%H%M%S")
+        _fresh(stamp)
+        base = (f"{SLIDER_BASE}imagery/{stamp:%Y/%m/%d}/{satellite}---full_disk/geocolor/"
+                f"{raw_stamp}/{count.bit_length() - 1:02d}/")
+        try:
+            image = _tile_grid(lambda x, y: f"{base}{y:03d}_{x:03d}.png", count,
+                               SLIDER_TILE_SIZES[satellite])
+            image.info["observed_at_utc"] = stamp.isoformat() + "Z"
+            return image, base + f"#stitched-{count}d"
+        except DownloadCancelled:
+            raise
+        except SourceError as error:
+            errors.append(str(error))
+    raise SourceError("CIRA incomplete recent frames: " + "; ".join(errors))
 
 
-def fetch_goes16_geocolor() -> Tuple[Image.Image, str]:
-	# Avoid CDN cache by appending timestamp query
-	ts = int(dt.datetime.utcnow().timestamp())
-	url = f"{GOES16_BASE}?t={ts}"
-	try:
-		img = _download_image(url, extra_headers={"Pragma": "no-cache"})
-		log.info(f"goes16 success: {url} size={img.size}")
-		return img, GOES16_BASE
-	except Exception as e:
-		raise SourceError(str(e))
+def fetch_asia_pacific_best_effort(tile_count=None):
+    count = _himawari_tile_count(tile_count)
+    return _best_effort([
+        ("Himawari mirrors", lambda: fetch_himawari_latest(count)),
+        ("CIRA Himawari-9", lambda: fetch_slider_latest("himawari", count)),
+    ])
 
 
-# --- NASA EPIC Natural color latest ---
-EPIC_API = "https://api.nasa.gov/EPIC/api/natural/images"
-EPIC_ARCHIVE = "https://epic.gsfc.nasa.gov/archive/natural/{y}/{m}/{d}/png/{name}.png"
+def fetch_asia_pacific_2k_best_effort():
+    return fetch_asia_pacific_best_effort(4)
 
 
-def fetch_epic_latest() -> Tuple[Image.Image, str]:
-	params = {"api_key": NASA_API_KEY}
-	log.info(f"epic query: {EPIC_API} params={params}")
-	session = _get_session()
-	resp = session.get(EPIC_API, params=params, timeout=TIMEOUT, headers={"User-Agent": USER_AGENT}, verify=certifi.where())
-	log.info(f"epic response: status={resp.status_code}")
-	resp.raise_for_status()
-	data = resp.json()
-	if not data:
-		log.error("epic empty list")
-		raise SourceError("EPIC empty response")
-	latest = data[0]
-	date_str = latest.get("date")
-	image_name = latest.get("image")
-	log.info(f"epic latest: date={date_str} image={image_name}")
-	date = dt.datetime.fromisoformat(date_str)
-	url = EPIC_ARCHIVE.format(y=date.strftime("%Y"), m=date.strftime("%m"), d=date.strftime("%d"), name=image_name)
-	img = _download_image(url)
-	return img, url
+def fetch_asia_pacific_4k_best_effort():
+    return fetch_asia_pacific_best_effort(8)
 
 
-# --- NASA APOD image-only ---
-APOD_API = "https://api.nasa.gov/planetary/apod"
+def fetch_gk2a_latest():
+    return fetch_slider_latest("gk2a", 4)
 
 
-def fetch_apod_image() -> Tuple[Image.Image, str]:
-	params = {"api_key": NASA_API_KEY, "thumbs": "true"}
-	log.info(f"apod query: {APOD_API} params={params}")
-	session = _get_session()
-	resp = session.get(APOD_API, params=params, timeout=TIMEOUT, headers={"User-Agent": USER_AGENT}, verify=certifi.where())
-	log.info(f"apod response: status={resp.status_code}")
-	resp.raise_for_status()
-	data = resp.json()
-	media_type = data.get("media_type")
-	url = None
-	if media_type == "image":
-		url = data.get("hdurl") or data.get("url")
-	elif media_type == "video":
-		url = data.get("thumbnail_url") or data.get("url")
-	log.info(f"apod media_type={media_type} url={url}")
-	if not url:
-		raise SourceError("APOD no image url")
-	img = _download_image(url)
-	return img, url
+def fetch_goes_geocolor(satellite="GOES19"):
+    url = f"https://cdn.star.nesdis.noaa.gov/{satellite}/ABI/FD/GEOCOLOR/1808x1808.jpg"
+    return _download_image(url, max_age=MAX_SATELLITE_AGE, min_size=1600), url
 
 
-# --- NASA SDO Sun latest (AIA 0171 as example) ---
-SDO_CANDIDATES = [
-	"https://sdo.gsfc.nasa.gov/assets/img/latest/latest_4096_0171.jpg",
-	"https://sdo.gsfc.nasa.gov/assets/img/latest/latest_4096_HMIIC.jpg",
-]
+def fetch_earth_best_effort():
+    return _best_effort([
+        ("NOAA GOES-19", lambda: fetch_goes_geocolor("GOES19")),
+        ("CIRA GOES-19", lambda: fetch_slider_latest("goes-19", 4)),
+    ])
 
 
-def fetch_sdo_latest() -> Tuple[Image.Image, str]:
-	allow_insecure_env = os.getenv("ALLOW_INSECURE_SDO", "0") == "1"
-	last_error = None
-	for url in SDO_CANDIDATES:
-		try:
-			img = _download_image(url)
-			log.info(f"sdo success: {url} size={img.size}")
-			return img, url
-		except SSLError as e:
-			log.warning(f"sdo SSL error (secure): {e}")
-			last_error = e
-			if allow_insecure_env:
-				try:
-					log.warning("sdo retrying with insecure SSL (verify=False)")
-					img = _download_image(url, allow_insecure=True)
-					return img, url
-				except Exception as ie:
-					log.error(f"sdo insecure fetch failed: {ie}")
-					last_error = ie
-		except Exception as e:
-			log.warning(f"sdo failed: {url} error={e}")
-			last_error = e
-	if last_error:
-		raise SourceError(f"SDO failed: {last_error}")
-	raise SourceError("SDO unknown failure")
+def fetch_goes_west_best_effort():
+    return _best_effort([
+        ("NOAA GOES-18", lambda: fetch_goes_geocolor("GOES18")),
+        ("CIRA GOES-18", lambda: fetch_slider_latest("goes-18", 4)),
+    ])
 
 
-# --- NASA Mars Rover Images (Alternative space view) ---
-MARS_ROVER_CANDIDATES = [
-	"https://api.nasa.gov/mars-photos/api/v1/rovers/perseverance/latest_photos?api_key={key}",
-	"https://api.nasa.gov/mars-photos/api/v1/rovers/curiosity/latest_photos?api_key={key}",
-]
+def fetch_epic_latest():
+    data = _json("https://epic.gsfc.nasa.gov/api/natural")
+    if not data:
+        raise SourceError("EPIC returned no images")
+    latest = max(data, key=lambda item: item["date"])
+    stamp = dt.datetime.fromisoformat(latest["date"])
+    _fresh(stamp, dt.timedelta(days=14))
+    url = f"https://epic.gsfc.nasa.gov/archive/natural/{stamp:%Y/%m/%d}/jpg/{latest['image']}.jpg"
+    image = _download_image(url, min_size=1000)
+    image.info["observed_at_utc"] = stamp.isoformat() + "Z"
+    return image, url
 
 
-def fetch_mars_rover_latest() -> Tuple[Image.Image, str]:
-	# Get latest Mars rover photo as alternative space content
-	session = _get_session()
-	for url_template in MARS_ROVER_CANDIDATES:
-		try:
-			url = url_template.format(key=NASA_API_KEY)
-			log.info(f"mars query: {url}")
-			resp = session.get(url, timeout=TIMEOUT, headers={"User-Agent": USER_AGENT}, verify=certifi.where())
-			log.info(f"mars response: status={resp.status_code}")
-			resp.raise_for_status()
-			data = resp.json()
-			photos = data.get("latest_photos", [])
-			if not photos:
-				continue
-			# Get the first available photo
-			photo_url = photos[0]["img_src"]
-			log.info(f"mars photo selected: {photo_url}")
-			img = _download_image(photo_url)
-			return img, photo_url
-		except Exception as e:
-			log.warning(f"mars failed: {url_template} error={e}")
-			continue
-	raise SourceError("Mars rover images unavailable")
+APOD_API = "https://science.nasa.gov/wp-json/wp/v2/apod-basic"
 
 
-def fetch_earth_best_effort() -> Tuple[Image.Image, str]:
-	try:
-		return fetch_goes16_geocolor()
-	except Exception as e:
-		log.warning(f"earth fallback to EPIC due to: {e}")
-		return fetch_epic_latest()
+def fetch_apod_image():
+    today = dt.datetime.now(dt.timezone.utc).date()
+    params = {"start_date": (today - dt.timedelta(days=7)).isoformat(), "end_date": today.isoformat()}
+    data = _json(APOD_API + "?" + urlencode(params))
+    if isinstance(data, dict):
+        data = [data]
+    for item in sorted(data, key=lambda item: item.get("date", ""), reverse=True):
+        # New API's url points to an HTML article; download hdurl.
+        if item.get("media_type") == "image" and item.get("hdurl"):
+            url = item["hdurl"]
+            image = _download_image(url, min_size=400)
+            image.info["published_date"] = item["date"]
+            return image, url
+    raise SourceError("No APOD image available in the last seven days")
 
 
-# --- NASA Worldview MODIS/VIIRS (Asia-Pacific alternative) ---
-WORLDVIEW_ASIA_CANDIDATES = [
-	# MODIS Aqua True Color (Asia-Pacific region)
-	"https://gibs.earthdata.nasa.gov/wmts/1.0.0/MODIS_Aqua_CorrectedReflectance_TrueColor/default/{date}/GoogleMapsCompatible_Level9/5/12/21.jpg",
-	"https://gibs.earthdata.nasa.gov/wmts/1.0.0/MODIS_Terra_CorrectedReflectance_TrueColor/default/{date}/GoogleMapsCompatible_Level9/5/12/21.jpg",
-	# VIIRS SNPP Day Night Band (for night/day coverage)
-	"https://gibs.earthdata.nasa.gov/wmts/1.0.0/VIIRS_SNPP_CorrectedReflectance_TrueColor/default/{date}/GoogleMapsCompatible_Level9/5/12/21.jpg",
-]
-
-def fetch_worldview_asia_latest() -> Tuple[Image.Image, str]:
-	# Get current date in the format needed for NASA GIBS
-	from datetime import datetime, timedelta
-	
-	# Try current date and previous few days in case of delays
-	for days_back in range(0, 5):
-		date = (datetime.utcnow() - timedelta(days=days_back)).strftime("%Y-%m-%d")
-		
-		for url_template in WORLDVIEW_ASIA_CANDIDATES:
-			url = url_template.format(date=date)
-			try:
-				log.info(f"worldview asia query: {url}")
-				img = _download_image(url)
-				log.info(f"worldview asia success: {url} size={img.size}")
-				return img, url
-			except Exception as e:
-				log.warning(f"worldview asia failed: {url} error={e}")
-				continue
-	
-	raise SourceError("NASA Worldview Asia-Pacific images unavailable")
+def fetch_sky_best_effort():
+    return fetch_apod_image()
 
 
-# --- MODIS Global as backup for Asia-Pacific ---
-MODIS_GLOBAL_CANDIDATES = [
-	# NASA GIBS MODIS global composite (covers Asia-Pacific)
-	"https://map1.vis.earthdata.nasa.gov/wmts-geo/1.0.0/MODIS_Aqua_CorrectedReflectance_TrueColor/default/{date}/EPSG4326_1km/0/0/0.jpg",
-	"https://map1.vis.earthdata.nasa.gov/wmts-geo/1.0.0/MODIS_Terra_CorrectedReflectance_TrueColor/default/{date}/EPSG4326_1km/0/0/0.jpg",
-]
-
-def fetch_modis_global_latest() -> Tuple[Image.Image, str]:
-	from datetime import datetime, timedelta
-	
-	for days_back in range(0, 3):
-		date = (datetime.utcnow() - timedelta(days=days_back)).strftime("%Y-%m-%d")
-		
-		for url_template in MODIS_GLOBAL_CANDIDATES:
-			url = url_template.format(date=date)
-			try:
-				log.info(f"modis global query: {url}")
-				img = _download_image(url)
-				log.info(f"modis global success: {url} size={img.size}")
-				return img, url
-			except Exception as e:
-				log.warning(f"modis global failed: {url} error={e}")
-				continue
-	
-	raise SourceError("MODIS global images unavailable")
+def _fetch_suvi(role):
+    data = _json(f"https://services.swpc.noaa.gov/products/animations/suvi-{role}-171.json")
+    if not data:
+        raise SourceError("SUVI returned no images")
+    path = max(item["url"] for item in data)
+    match = re.search(r"_s(\d{8}T\d{6})Z", path)
+    if not match:
+        raise SourceError("SUVI observation timestamp missing")
+    stamp = dt.datetime.strptime(match.group(1), "%Y%m%dT%H%M%S")
+    _fresh(stamp)
+    url = urljoin("https://services.swpc.noaa.gov", path)
+    image = _download_image(url, min_size=1000)
+    image.info["observed_at_utc"] = stamp.isoformat() + "Z"
+    return image, url
 
 
-def fetch_asia_pacific_best_effort(tile_count: Optional[int] = None) -> Tuple[Image.Image, str]:
-	try:
-		log.info("asia-pacific using Himawari full-disk")
-		return fetch_himawari_latest(tile_count=tile_count)
-	except Exception as e:
-		log.warning(f"asia-pacific fallback to JMA Himawari sector due to: {e}")
-	try:
-		return fetch_jma_himawari_sector_latest()
-	except Exception as e:
-		log.warning(f"asia-pacific fallback to EPIC due to: {e}")
-	try:
-		return fetch_epic_latest()
-	except Exception as e:
-		log.warning(f"asia-pacific fallback to GOES due to: {e}")
-		return fetch_goes16_geocolor()
+def fetch_sdo_latest():
+    """Legacy mode name, now served by the live GOES SUVI solar telescope."""
+    return _best_effort([(f"NOAA SUVI {role}", lambda role=role: _fetch_suvi(role))
+                         for role in ("primary", "secondary")])
 
 
-def fetch_asia_pacific_2k_best_effort() -> Tuple[Image.Image, str]:
-	return fetch_asia_pacific_best_effort(tile_count=4)
+MARS_GALLERY_API = "https://science.nasa.gov/wp-json/wp/v2/image-article"
 
 
-def fetch_asia_pacific_4k_best_effort() -> Tuple[Image.Image, str]:
-	return fetch_asia_pacific_best_effort(tile_count=8)
+def fetch_mars_best_effort():
+    # This is a curated gallery, not a real-time rover downlink.
+    params = {"search": "Curiosity", "per_page": 10, "_embed": "true"}
+    data = _json(MARS_GALLERY_API + "?" + urlencode(params))
+    for post in sorted(data, key=lambda item: item.get("date", ""), reverse=True):
+        for media in post.get("_embedded", {}).get("wp:featuredmedia", []):
+            alt = media.get("alt_text", "").lower()
+            if "mars" in alt and "rover" in alt and media.get("source_url"):
+                url = media["source_url"]
+                image = _download_image(url, min_size=400)
+                image.info["published_date"] = post["date"]
+                return image, url
+    raise SourceError("NASA Mars rover gallery returned no matching images")
 
 
-def fetch_sky_best_effort() -> Tuple[Image.Image, str]:
-	try:
-		return fetch_apod_image()
-	except Exception as e:
-		log.warning(f"sky fallback to Mars due to: {e}")
-		return fetch_mars_rover_latest()
+GIBS_WMS = "https://gibs.earthdata.nasa.gov/wms/epsg4326/best/wms.cgi"
+GIBS_MAP_SIZE = 2200
+GIBS_LAYERS = ["MODIS_Terra_CorrectedReflectance_TrueColor",
+               "MODIS_Aqua_CorrectedReflectance_TrueColor",
+               "VIIRS_NOAA20_CorrectedReflectance_TrueColor"]
 
 
-def fetch_mars_best_effort() -> Tuple[Image.Image, str]:
-	try:
-		return fetch_mars_rover_latest()
-	except Exception as e:
-		log.warning(f"mars fallback to SDO due to: {e}")
-		return fetch_sdo_latest()
+def _missing_map_mask(image):
+    red, green, blue = image.split()
+    try:
+        with ImageChops.lighter(red, green) as first:
+            with ImageChops.lighter(first, blue) as maximum:
+                return maximum.point(lambda value: 255 if value <= 4 else 0)
+    finally:
+        red.close()
+        green.close()
+        blue.close()
+
+
+def fetch_worldview_asia_latest():
+    """Fill orbital gaps with other daily sensors, then the preceding day."""
+    today = dt.datetime.now(dt.timezone.utc).date()
+    result = Image.new("RGB", (GIBS_MAP_SIZE, GIBS_MAP_SIZE))
+    used, missing_fraction = [], 1.0
+    try:
+        for days_back in (1, 2):
+            for layer in GIBS_LAYERS:
+                params = dict(SERVICE="WMS", VERSION="1.1.1", REQUEST="GetMap", LAYERS=layer,
+                              TIME=(today - dt.timedelta(days=days_back)).isoformat(),
+                              SRS="EPSG:4326", BBOX="80,-50,180,60",
+                              WIDTH=GIBS_MAP_SIZE, HEIGHT=GIBS_MAP_SIZE, FORMAT="image/jpeg")
+                url = GIBS_WMS + "?" + urlencode(params)
+                try:
+                    with _download_image(url, min_size=GIBS_MAP_SIZE) as image:
+                        if image.size != result.size:
+                            raise SourceError("GIBS returned incorrect map dimensions")
+                        with _missing_map_mask(result) as mask:
+                            result.paste(image, (0, 0), mask)
+                    used.append({"layer": layer, "date": params["TIME"], "url": url})
+                    with _missing_map_mask(result) as mask:
+                        missing_fraction = mask.histogram()[255] / (GIBS_MAP_SIZE ** 2)
+                    if missing_fraction <= 0.002:
+                        break
+                except DownloadCancelled:
+                    raise
+                except Exception as error:
+                    log.warning("GIBS product failed: %s %s: %s", layer, params["TIME"], error)
+            if missing_fraction <= 0.002:
+                break
+        if not used or missing_fraction > 0.02:
+            raise SourceError(f"GIBS coverage incomplete: {missing_fraction:.1%} missing")
+        result.info.update(observation_dates=sorted({item["date"] for item in used}),
+                           layers=[item["layer"] for item in used],
+                           coverage_percent=round((1 - missing_fraction) * 100, 2))
+        return result, used[0]["url"] + "#daily-composite"
+    except BaseException:
+        result.close()
+        raise

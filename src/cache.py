@@ -16,15 +16,9 @@ def ensure_cache_dir() -> None:
 
 def md5_of_image(img: Image.Image) -> str:
 	# Compute MD5 of raw RGB bytes at a moderate size to stabilize across formats
-	preview = img.copy()
-	preview = preview.convert("RGB")
-	max_side = 1024
-	w, h = preview.size
-	if max(w, h) > max_side:
-		ratio = max_side / max(w, h)
-		preview = preview.resize((int(w * ratio), int(h * ratio)))
-	rgb_bytes = preview.tobytes()
-	return hashlib.md5(rgb_bytes).hexdigest()
+	with img.convert("RGB") as preview:
+		preview.thumbnail((1024, 1024))
+		return hashlib.md5(preview.tobytes()).hexdigest()
 
 
 def read_last() -> tuple[Optional[str], Optional[str]]:

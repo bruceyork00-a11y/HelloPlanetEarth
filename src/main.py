@@ -18,6 +18,11 @@ from .sources import (
 	fetch_asia_pacific_4k_best_effort,
 	fetch_sdo_latest,
 	fetch_mars_best_effort,
+	fetch_goes_west_best_effort,
+	fetch_gk2a_latest,
+	fetch_epic_latest,
+	fetch_worldview_asia_latest,
+	download_scope,
 )
 from .wallpaper import set_wallpaper_from_image
 from .cache import read_last, write_last, md5_of_image
@@ -43,6 +48,14 @@ _INSTANCE_MUTEX = None
 def _fetcher(mode: str) -> Callable[[], Tuple[Image.Image, str]]:
 	if mode == "earth":
 		return fetch_earth_best_effort
+	elif mode == "goes_west":
+		return fetch_goes_west_best_effort
+	elif mode == "asia_gk2a":
+		return fetch_gk2a_latest
+	elif mode == "earth_epic":
+		return fetch_epic_latest
+	elif mode == "asia_modis":
+		return fetch_worldview_asia_latest
 	elif mode in ("asia", "asia_2k"):
 		return fetch_asia_pacific_2k_best_effort
 	elif mode == "asia_4k":
@@ -83,13 +96,14 @@ class Runner:
 			fetch = _fetcher(mode)
 			img = None
 			try:
-				img, url = fetch()
+				with download_scope(self._stop):
+					img, url = fetch()
 				hashv = md5_of_image(img)
 				last_url, last_hash = read_last()
 				log.info(f"tick: mode={mode} url={url} hash={hashv} last_url={last_url} last_hash={last_hash} force={force}")
 				with self._lock:
 					# Do not let an older download overwrite a newly selected mode.
-					if mode_version != self._mode_version:
+					if self._stop.is_set() or mode_version != self._mode_version:
 						log.info(f"tick: discard stale result for mode={mode}")
 						return
 					if not force and last_url == url and last_hash == hashv:
@@ -111,6 +125,7 @@ class Runner:
 		last_start = time.monotonic()
 		while not self._stop.is_set():
 			with self._lock:
+				self._wakeup.clear()
 				interval_seconds = self.interval_seconds
 				force = self._force_refresh_requested
 				self._force_refresh_requested = False
@@ -124,10 +139,11 @@ class Runner:
 			except Exception as e:
 				log.error(f"runner error: {e}")
 			last_start = time.monotonic()
+			if self._stop.is_set():
+				break
 			with self._lock:
 				interval_seconds = self.interval_seconds
 			self._wakeup.wait(interval_seconds)
-			self._wakeup.clear()
 		log.info("runner stopped")
 
 	def start(self):
@@ -144,8 +160,8 @@ class Runner:
 		"""Schedule a cache-bypassing refresh without blocking the tray UI."""
 		with self._lock:
 			self._force_refresh_requested = True
+			self._wakeup.set()
 		log.info("force refresh requested")
-		self._wakeup.set()
 
 	def switch_mode(self, new_mode: str):
 		with self._lock:
@@ -153,14 +169,14 @@ class Runner:
 			self.mode = new_mode
 			self._mode_version += 1
 			self._force_refresh_requested = True
+			self._wakeup.set()
 		log.info(f"mode refresh requested: {new_mode}")
-		self._wakeup.set()
 
 	def set_interval(self, interval_seconds: int):
 		with self._lock:
 			log.info(f"switch interval: {self.interval_seconds}s -> {interval_seconds}s")
 			self.interval_seconds = interval_seconds
-		self._wakeup.set()
+			self._wakeup.set()
 
 	def get_mode(self) -> str:
 		with self._lock:
@@ -254,7 +270,7 @@ def parse_args(argv: list) -> argparse.Namespace:
 	parser = argparse.ArgumentParser(description="HelloPlanet realtime wallpaper")
 	parser.add_argument(
 		"--mode",
-		choices=["earth", "asia", "asia_2k", "asia_4k", "asia_custom", "sky", "sun_sdo", "mars"],
+		choices=["earth", "goes_west", "asia", "asia_2k", "asia_4k", "asia_custom", "asia_gk2a", "asia_modis", "earth_epic", "sky", "sun_sdo", "mars"],
 		default=None,
 	)
 	parser.add_argument("--interval", type=int, default=None)

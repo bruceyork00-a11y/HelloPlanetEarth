@@ -4,9 +4,11 @@ This folder contains copy-ready launch materials for free promotion and distribu
 
 ## Core Links
 
-- Gitee: https://gitee.com/yinxiaolong007/hello-planet-earth
-- Windows exe page: https://gitee.com/yinxiaolong007/hello-planet-earth/blob/master/dist/HelloPlanet.exe
-- Source archive: https://gitee.com/yinxiaolong007/hello-planet-earth/repository/archive/master.zip
+- Primary repository: https://github.com/bruceyork00-a11y/HelloPlanetEarth
+- Windows ZIP: https://github.com/bruceyork00-a11y/HelloPlanetEarth/raw/refs/heads/master/dist/HelloPlanet-v1.4.0-win64.zip
+- Windows exe page: https://github.com/bruceyork00-a11y/HelloPlanetEarth/blob/master/dist/HelloPlanet.exe
+- Source archive: https://github.com/bruceyork00-a11y/HelloPlanetEarth/archive/refs/heads/master.zip
+- Gitee mirror: https://gitee.com/yinxiaolong007/hello-planet-earth
 
 ## One-Line Pitch
 

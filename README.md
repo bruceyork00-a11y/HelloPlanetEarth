@@ -2,12 +2,14 @@
 
 HelloPlanet 是一个 Windows 实时地球/星空壁纸工具。它会从公开卫星与 NASA 数据源抓取最新图片，定时更新桌面壁纸，并通过系统托盘菜单控制模式、刷新频率和语言。
 
+主仓库：[GitHub · HelloPlanetEarth](https://github.com/bruceyork00-a11y/HelloPlanetEarth)。Gitee 保留为备用镜像。
+
 ## 下载
 
-- Windows ZIP（v1.4.0）: [dist/HelloPlanet-v1.4.0-win64.zip](dist/HelloPlanet-v1.4.0-win64.zip)
-- Windows exe: [dist/HelloPlanet.exe](dist/HelloPlanet.exe)
-- Gitee exe 下载页: https://gitee.com/yinxiaolong007/hello-planet-earth/blob/master/dist/HelloPlanet.exe
-- 源码压缩包: https://gitee.com/yinxiaolong007/hello-planet-earth/repository/archive/master.zip
+- Windows ZIP（v1.4.0）: [GitHub 下载](https://github.com/bruceyork00-a11y/HelloPlanetEarth/raw/refs/heads/master/dist/HelloPlanet-v1.4.0-win64.zip)
+- Windows exe: [GitHub 文件页](https://github.com/bruceyork00-a11y/HelloPlanetEarth/blob/master/dist/HelloPlanet.exe)
+- 源码压缩包: [GitHub master ZIP](https://github.com/bruceyork00-a11y/HelloPlanetEarth/archive/refs/heads/master.zip)
+- Gitee 备用镜像: https://gitee.com/yinxiaolong007/hello-planet-earth
 
 ## 功能
 
@@ -48,6 +50,22 @@ python app.py --mode earth_epic
 python app.py --mode sky
 python app.py --mode sun_sdo
 python app.py --mode mars
+```
+
+## 仓库协作
+
+后续开发、问题反馈和版本管理以 GitHub 为主，当前主分支为 `master`。本地 `origin` 指向 GitHub，`gitee` 为备用镜像。
+
+```bash
+git push origin master
+git push origin --tags
+```
+
+需要同步 Gitee 时：
+
+```bash
+git push gitee master
+git push gitee --tags
 ```
 
 ## 打包

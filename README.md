@@ -4,7 +4,7 @@ HelloPlanet 是一个 Windows 实时地球/星空壁纸工具。它会从公开�
 
 ## 下载
 
-- Windows ZIP（v1.3.0）: [dist/HelloPlanet-v1.3.0-win64.zip](dist/HelloPlanet-v1.3.0-win64.zip)
+- Windows ZIP（v1.4.0）: [dist/HelloPlanet-v1.4.0-win64.zip](dist/HelloPlanet-v1.4.0-win64.zip)
 - Windows exe: [dist/HelloPlanet.exe](dist/HelloPlanet.exe)
 - Gitee exe 下载页: https://gitee.com/yinxiaolong007/hello-planet-earth/blob/master/dist/HelloPlanet.exe
 - 源码压缩包: https://gitee.com/yinxiaolong007/hello-planet-earth/repository/archive/master.zip
@@ -17,6 +17,8 @@ HelloPlanet 是一个 Windows 实时地球/星空壁纸工具。它会从公开�
 - 中英文托盘菜单切换
 - 默认无控制台窗口，日志窗口可在托盘菜单中手动开启
 - 鼠标悬浮托盘图标显示上次更新时间
+- 下载进度、更新结果、下次检查时间与设置保存失败反馈
+- 壁纸显示方式：完整显示、铺满、居中、拉伸、平铺；切换立即生效并保存
 
 ## 运行
 
@@ -62,10 +64,10 @@ pyinstaller HelloPlanet.spec --clean --noconfirm
 
 - 当前图片源无需 API key，旧的 `NASA_API_KEY` 不再需要。
 - `MODE`: 默认模式，例如 `earth`、`asia_2k`、`asia_4k`
-- `INTERVAL_SECONDS`: 默认刷新间隔秒数，默认 1800
+- `INTERVAL_SECONDS`: 默认刷新间隔秒数，默认 1800，允许范围 300–86400
 - `LOG_LEVEL`: 日志等级，默认 `INFO`
 - `HELLOPLANET_LANG`: 默认托盘语言，`zh` 或 `en`
-- `HIMAWARI_TILE_COUNT`: 自定义 Himawari 瓦片层级，仅 `asia_custom` 使用
+- `HIMAWARI_TILE_COUNT`: 自定义 Himawari 瓦片层级，仅 `asia_custom` 使用，支持 1/2/4/8
 
 ## 注意
 
@@ -96,3 +98,13 @@ pyinstaller HelloPlanet.spec --clean --noconfirm
 ```
 
 网络检查会下载并完整解码每幅图、核对尺寸与非空内容，并将结果和预览保存到 `build/source-audit/`，不会改动桌面壁纸。完整审计记录见 `docs/source-audit-baseline.json` 与 `docs/source-audit-results.json`。
+
+## 性能、安全与体验（v1.4.0）
+
+- 不变的观测图复用无损缓存，最多三张、总计 128 MiB，位置为 `%LOCALAPPDATA%\HelloPlanet\frames`。强制刷新绕过缓存。
+- 切换模式会取消旧任务，下载期间禁用重复强制刷新；失败后延长重试间隔，手动重试不受等待时间限制。
+- 左键、右键均可打开托盘菜单，模式选择减少一级子菜单；状态与进度静默显示，不自动弹出窗口。
+- HTTP 请求连接前及每次重定向均检查 HTTPS 与可信域名，拒绝凭据 URL 和非标准端口；仅解码 JPEG/PNG/WebP/GIF，GIF 取首帧，最多 3200 万像素，瓦片严格核对原生尺寸。
+- 配置及壁纸文件原子写入；壁纸使用交替文件，写入失败不会破坏正在使用的文件。非法配置、损坏缓存和日志目录不可写均有安全回退。
+- 使用当前已安装并验证的 Pillow 12.3.0、Requests 2.34.2 与 pystray 0.19.5；EXE 包含版本信息，移除重复源文件打包。
+- 详细检查结果与局部 CPU/内存基准见 `docs/optimization-v1.4.0.md`。这些结果不是全面渗透测试或所有 Windows 版本兼容性保证。

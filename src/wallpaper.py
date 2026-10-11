@@ -37,17 +37,34 @@ def _set_style_in_registry(style: str) -> None:
 
 def _save_as_bmp(image: Image.Image, target_path: str) -> str:
 	os.makedirs(os.path.dirname(target_path), exist_ok=True)
-	with image.convert("RGB") as rgb_image:
-		rgb_image.save(target_path, format="BMP")
-		log.info(f"bmp saved: path={target_path} size={rgb_image.size}")
+	temp = None
+	try:
+		with tempfile.NamedTemporaryFile(dir=os.path.dirname(target_path), suffix=".bmp", delete=False) as file:
+			temp = file.name
+		if image.mode == "RGB":
+			image.save(temp, format="BMP")
+		else:
+			with image.convert("RGB") as rgb_image:
+				rgb_image.save(temp, format="BMP")
+		os.replace(temp, target_path)
+	finally:
+		if temp:
+			try:
+				os.unlink(temp)
+			except OSError:
+				pass
+	log.info(f"bmp saved: path={target_path} size={image.size}")
 	return target_path
 
 
 def set_wallpaper_from_image(image: Image.Image, style: str = "fill") -> None:
-	_set_style_in_registry(style)
 	cache_dir = os.path.join(tempfile.gettempdir(), "hello_planet")
-	bmp_path = os.path.join(cache_dir, "current_wallpaper.bmp")
+	with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Control Panel\Desktop") as key:
+		previous_path = winreg.QueryValueEx(key, "Wallpaper")[0]
+	name = "wallpaper-b.bmp" if os.path.basename(previous_path).lower() == "wallpaper-a.bmp" else "wallpaper-a.bmp"
+	bmp_path = os.path.join(cache_dir, name)
 	bmp_path = _save_as_bmp(image, bmp_path)
+	_set_style_in_registry(style)
 	ctypes.windll.user32.SystemParametersInfoW.argtypes = [wintypes.UINT, wintypes.UINT, wintypes.LPWSTR, wintypes.UINT]
 	ctypes.windll.user32.SystemParametersInfoW.restype = wintypes.BOOL
 	log.info("SPI set wallpaper calling...")

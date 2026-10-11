@@ -1,0 +1,167 @@
+{
+  "tested_at_utc": "2026-10-11T04:24:43.899706+00:00",
+  "results": [
+    {
+      "case": "asia_2k",
+      "size": [
+        2200,
+        2200
+      ],
+      "url": "https://jh190005-4.kudpc.kyoto-u.ac.jp/himawari/img/D531106/4d/550/2026/10/11/040000_0_0.png#stitched-4d",
+      "metadata": {
+        "observed_at_utc": "2026-10-11T04:00:00Z",
+        "provider": "Himawari mirrors"
+      },
+      "image_sha256": "e2603a94ff281115ae07b6d786537efe0c8533ca6c8e4ebfff71ef58e76f880e",
+      "status": "pass",
+      "seconds": 9.65
+    },
+    {
+      "case": "asia_4k",
+      "size": [
+        4400,
+        4400
+      ],
+      "url": "https://jh190005-4.kudpc.kyoto-u.ac.jp/himawari/img/D531106/8d/550/2026/10/11/040000_0_0.png#stitched-8d",
+      "metadata": {
+        "observed_at_utc": "2026-10-11T04:00:00Z",
+        "provider": "Himawari mirrors"
+      },
+      "image_sha256": "d993390e414c41db1292b3b6ae6e865a99d7379e83dbf5716b807623b8af66bd",
+      "status": "pass",
+      "seconds": 11.16
+    },
+    {
+      "case": "asia_gk2a",
+      "size": [
+        2752,
+        2752
+      ],
+      "url": "https://slider.cira.colostate.edu/data/imagery/2026/10/11/gk2a---full_disk/geocolor/20261011034000/02/#stitched-4d",
+      "metadata": {
+        "observed_at_utc": "2026-10-11T03:40:00Z"
+      },
+      "image_sha256": "15886c405b11a2e85c356af957b7b6f31c916869d718235ccb88a15683ceec95",
+      "status": "pass",
+      "seconds": 12.29
+    },
+    {
+      "case": "asia_modis",
+      "size": [
+        2200,
+        2200
+      ],
+      "url": "https://gibs.earthdata.nasa.gov/wms/epsg4326/best/wms.cgi?SERVICE=WMS&VERSION=1.1.1&REQUEST=GetMap&LAYERS=MODIS_Terra_CorrectedReflectance_TrueColor&TIME=2026-10-10&SRS=EPSG%3A4326&BBOX=80%2C-50%2C180%2C60&WIDTH=2200&HEIGHT=2200&FORMAT=image%2Fjpeg#daily-composite",
+      "metadata": {
+        "observation_dates": [
+          "2026-10-10"
+        ],
+        "layers": [
+          "MODIS_Terra_CorrectedReflectance_TrueColor",
+          "MODIS_Aqua_CorrectedReflectance_TrueColor"
+        ],
+        "coverage_percent": 99.86
+      },
+      "image_sha256": "95a387a74e53ec7ee049a3a2945a3bd44dea53e8305a6c3ec9795c289d1ac612",
+      "status": "pass",
+      "seconds": 11.22
+    },
+    {
+      "case": "earth",
+      "size": [
+        1808,
+        1808
+      ],
+      "url": "https://cdn.star.nesdis.noaa.gov/GOES19/ABI/FD/GEOCOLOR/1808x1808.jpg",
+      "metadata": {
+        "source_url": "https://cdn.star.nesdis.noaa.gov/GOES19/ABI/FD/GEOCOLOR/1808x1808.jpg",
+        "last_modified": "Sun, 11 Oct 2026 04:14:59 GMT",
+        "provider": "NOAA GOES-19"
+      },
+      "image_sha256": "80b4dd6bbc83d80813c3f174568a20bdd442c1105001d2640872f751947cd18b",
+      "status": "pass",
+      "seconds": 2.96
+    },
+    {
+      "case": "earth_epic",
+      "size": [
+        1080,
+        1080
+      ],
+      "url": "https://epic.gsfc.nasa.gov/archive/natural/2026/10/08/jpg/epic_1b_20261008214500.jpg",
+      "metadata": {
+        "source_url": "https://epic.gsfc.nasa.gov/archive/natural/2026/10/08/jpg/epic_1b_20261008214500.jpg",
+        "last_modified": "Sat, 10 Oct 2026 12:01:12 GMT",
+        "observed_at_utc": "2026-10-08T21:40:11Z"
+      },
+      "image_sha256": "d7896df171d634ec3c2b1aa13ad53175fd688556a8ed691fea6a8201dab02547",
+      "status": "pass",
+      "seconds": 2.24
+    },
+    {
+      "case": "goes_west",
+      "size": [
+        1808,
+        1808
+      ],
+      "url": "https://cdn.star.nesdis.noaa.gov/GOES18/ABI/FD/GEOCOLOR/1808x1808.jpg",
+      "metadata": {
+        "source_url": "https://cdn.star.nesdis.noaa.gov/GOES18/ABI/FD/GEOCOLOR/1808x1808.jpg",
+        "last_modified": "Sun, 11 Oct 2026 04:14:47 GMT",
+        "provider": "NOAA GOES-18"
+      },
+      "image_sha256": "033868aead11d15397192984d72aa6f87cb19082d1c4858729afee452e712c3e",
+      "status": "pass",
+      "seconds": 1.39
+    },
+    {
+      "case": "mars",
+      "size": [
+        1280,
+        640
+      ],
+      "url": "https://assets.science.nasa.gov/dynamicimage/assets/science/cds/apod/apod/2026/october/Sol1943CuriosityBodrov.jpg",
+      "metadata": {
+        "source_url": "https://assets.science.nasa.gov/dynamicimage/assets/science/cds/apod/apod/2026/october/Sol1943CuriosityBodrov.jpg",
+        "last_modified": null,
+        "published_date": "2026-10-03T00:05:00"
+      },
+      "image_sha256": "2ec5095dcdf8f19aec126b5543842fd85ff4e1c5f37f17b73eda12cf2a4f733e",
+      "status": "pass",
+      "seconds": 1.87
+    },
+    {
+      "case": "sky",
+      "size": [
+        1280,
+        960
+      ],
+      "url": "https://assets.science.nasa.gov/dynamicimage/assets/science/cds/apod/apod/2026/october/deephole_icecube_4000.jpg?w=0&h=0&fit=clip&crop=faces%2Cfocalpoint",
+      "metadata": {
+        "source_url": "https://assets.science.nasa.gov/dynamicimage/assets/science/cds/apod/apod/2026/october/deephole_icecube_4000.jpg?w=0&h=0&fit=clip&crop=faces%2Cfocalpoint",
+        "last_modified": null,
+        "published_date": "2026-10-11"
+      },
+      "image_sha256": "bded150103f83833660a95d6bb1028e99f243ba795e6f7ed3206822f7a489f14",
+      "status": "pass",
+      "seconds": 3.12
+    },
+    {
+      "case": "sun_sdo",
+      "size": [
+        1280,
+        1280
+      ],
+      "url": "https://services.swpc.noaa.gov/images/animations/suvi/primary/171/or_suvi-l2-ci171_g19_s20261011T041200Z_e20261011T041600Z_v1-0-2.png",
+      "metadata": {
+        "source_url": "https://services.swpc.noaa.gov/images/animations/suvi/primary/171/or_suvi-l2-ci171_g19_s20261011T041200Z_e20261011T041600Z_v1-0-2.png",
+        "last_modified": "Sun, 11 Oct 2026 04:19:55 GMT",
+        "observed_at_utc": "2026-10-11T04:12:00Z",
+        "provider": "NOAA SUVI primary"
+      },
+      "image_sha256": "429967650ce8f9ec58597249712ba42d02248effa26ded525e94dc1cc90a48d5",
+      "status": "pass",
+      "seconds": 6.07
+    }
+  ]
+}

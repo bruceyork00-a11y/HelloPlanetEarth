@@ -13,6 +13,11 @@ from src.wallpaper import _save_as_bmp
 
 
 class SourceTests(unittest.TestCase):
+    def setUp(self):
+        for name, value in (("get", None), ("put", None)):
+            patcher = patch.object(sources.image_cache, name, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
     def test_shutdown_prevents_network_and_additional_fallbacks(self):
         event = threading.Event()
         event.set()
@@ -36,7 +41,7 @@ class SourceTests(unittest.TestCase):
 
     def test_missing_tile_rejects_entire_frame_and_closes_images(self):
         tiles = []
-        def download(url):
+        def download(url, **kwargs):
             if url == "1,1":
                 raise sources.SourceError("missing tile")
             image = Image.new("RGB", (2, 2), "blue")
@@ -50,7 +55,7 @@ class SourceTests(unittest.TestCase):
                 tile.getpixel((0, 0))
 
     def test_tile_placement_and_size(self):
-        def download(url):
+        def download(url, **kwargs):
             x, y = map(int, url.split(","))
             return Image.new("RGB", (2, 2), (x * 100, y * 100, 0))
         with patch.object(sources, "_download_image", side_effect=download):
@@ -146,7 +151,7 @@ class RunnerTests(unittest.TestCase):
     def test_force_request_during_tick_is_not_lost(self):
         runner = main.Runner("earth", 1800, "fill")
         calls = []
-        def tick(force=False):
+        def tick(force=False, bypass_cache=None):
             calls.append(force)
             if len(calls) == 1:
                 runner.force_refresh_now()
@@ -176,13 +181,14 @@ class AppTests(unittest.TestCase):
                               lambda: None, lambda: False, lambda: None, get_mode=runner.get_mode)
         menu = tray._build_menu()
         self.assertNotIn("刷新一次", [item.text for item in menu.items])
-        earth_items = menu.items[1].submenu.items[0].submenu.items
+        mode_item = next(item for item in menu.items if item.text == tray._text('mode'))
+        earth_items = mode_item.submenu.items
         earth_items[1](None)
         self.assertEqual(runner.get_mode(), "goes_west")
         self.assertTrue(earth_items[1].checked)
         self.assertFalse(earth_items[0].checked)
         tray.language = "en"
-        self.assertEqual(menu.items[0].text, "Force refresh")
+        self.assertIn("Force refresh", [item.text for item in menu.items])
         self.assertEqual(earth_items[1].text, "Pacific (GOES-18)")
 
     def test_bmp_encode_round_trip(self):

@@ -25,6 +25,7 @@ def setup_logging(level: str = "INFO", enable_console: bool = True) -> None:
 	# Clear existing handlers to avoid duplicates
 	for h in list(logger.handlers):
 		logger.removeHandler(h)
+		h.close()
 
 	formatter = logging.Formatter(
 		fmt="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -38,16 +39,23 @@ def setup_logging(level: str = "INFO", enable_console: bool = True) -> None:
 		logger.addHandler(ch)
 
 	# Rotating file handler
-	fh = RotatingFileHandler(get_log_path(), maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8")
-	fh.setLevel(numeric_level)
-	fh.setFormatter(formatter)
-	logger.addHandler(fh)
+	try:
+		fh = RotatingFileHandler(get_log_path(), maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8")
+		fh.setLevel(numeric_level)
+		fh.setFormatter(formatter)
+		logger.addHandler(fh)
+	except OSError:
+		if not logger.handlers:
+			logger.addHandler(logging.NullHandler())
 
 
 def install_crash_handler() -> None:
 	"""Install last-resort handlers so an unhandled exception is recorded to the
 	log file instead of silently vanishing (the tray icon just disappears)."""
-	log_path = get_log_path()
+	try:
+		log_path = get_log_path()
+	except OSError:
+		log_path = None
 
 	def _emit(exc_type, exc, tb):
 		try:
@@ -63,7 +71,8 @@ def install_crash_handler() -> None:
 	def _excepthook(exc_type, exc, tb):
 		_emit(exc_type, exc, tb)
 		# Let a hard crash still produce a visible error via stderr as a fallback.
-		traceback.print_exception(exc_type, exc, tb)
+		if sys.stderr is not None:
+			traceback.print_exception(exc_type, exc, tb, file=sys.stderr)
 
 	def _threading_excepthook(args):
 		# Called for exceptions in threads other than the main thread.

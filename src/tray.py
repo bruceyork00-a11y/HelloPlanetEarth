@@ -1,5 +1,6 @@
 import logging
 import os
+import sys
 from datetime import datetime
 from typing import Callable, Optional
 
@@ -9,6 +10,17 @@ import pystray
 
 log = logging.getLogger(__name__)
 APP_NAME = "HelloPlanet"
+
+if sys.platform == "win32":
+	class StatusIcon(pystray.Icon):
+		def _on_notify(self, wparam, lparam):
+			# Refresh only on the UI thread, before the popup opens.
+			if lparam in (0x0202, 0x0205):  # WM_LBUTTONUP / WM_RBUTTONUP
+				self.update_menu()
+				lparam = 0x0205
+			return super()._on_notify(wparam, lparam)
+else:
+	StatusIcon = pystray.Icon
 
 TEXT = {
 	"zh": {
@@ -37,6 +49,19 @@ TEXT = {
 		"chinese": "中文",
 		"english": "English",
 		"quit": "退出",
+		"idle": "等待更新",
+		"updating": "正在更新",
+		"updated": "壁纸已更新",
+		"unchanged": "暂无新图片，已检查",
+		"error": "更新失败，保留当前壁纸；可重试或换模式",
+		"settings_unsaved": "设置未保存，下次启动可能恢复旧值",
+		"display": "壁纸显示方式",
+		"fill": "铺满（可能裁剪）",
+		"fit": "完整显示（可能留边）",
+		"center": "居中（原尺寸）",
+		"stretch": "拉伸（可能变形）",
+		"tile": "平铺",
+		"next_check": "下次检查",
 	},
 	"en": {
 		"last_update": "Last update",
@@ -64,6 +89,19 @@ TEXT = {
 		"chinese": "中文",
 		"english": "English",
 		"quit": "Quit",
+		"idle": "Waiting for update",
+		"updating": "Updating",
+		"updated": "Wallpaper updated",
+		"unchanged": "Checked, no new image",
+		"error": "Update failed; wallpaper kept. Retry or change mode",
+		"settings_unsaved": "Settings not saved; may reset after restart",
+		"display": "Wallpaper display",
+		"fill": "Fill (may crop)",
+		"fit": "Fit (show whole image)",
+		"center": "Center (original size)",
+		"stretch": "Stretch (may distort)",
+		"tile": "Tile",
+		"next_check": "Next check",
 	},
 }
 
@@ -92,6 +130,9 @@ class TrayController:
 		get_mode: Callable[[], str] = None,
 		get_interval: Callable[[], int] = None,
 		get_last_update_time: Callable[[], Optional[datetime]] = None,
+		get_status=None,
+		on_set_style=None,
+		get_style=None,
 	):
 		self.on_force_refresh = on_force_refresh
 		self.on_switch_mode = on_switch_mode
@@ -103,6 +144,9 @@ class TrayController:
 		self.get_mode = get_mode or (lambda: "")
 		self.get_interval = get_interval or (lambda: 0)
 		self.get_last_update_time = get_last_update_time or (lambda: None)
+		self.get_status = get_status or (lambda: {"state": "idle"})
+		self.on_set_style = on_set_style or (lambda style: None)
+		self.get_style = get_style or (lambda: "fill")
 		self.language = self._normalize_language(initial_language or os.getenv("HELLOPLANET_LANG", "zh"))
 		self._icon = None
 
@@ -120,7 +164,23 @@ class TrayController:
 		return updated_at.strftime("%H:%M:%S")
 
 	def _title(self) -> str:
-		return f"{APP_NAME} - {self._text('last_update')}: {self._last_update_text()}"
+		return f"{APP_NAME} - {self._text('last_update')}: {self._last_update_text()} | {self._status_text()}"[:127]
+
+	def _status_text(self):
+		status = self.get_status()
+		key = status.get("state", "idle")
+		text = self._text(key if key in TEXT[self.language] else "idle")
+		if status.get("state") == "updating" and status.get("progress"):
+			done, total = status["progress"]
+			text += f" ({done}/{total})"
+		elif status.get("state") == "updated" and status.get("resolution"):
+			width, height = status["resolution"]
+			text += f" ({width}x{height})"
+		return text
+
+	def set_status(self, status):
+		if self._icon:
+			self._icon.title = self._title()
 
 	def _label(self, key: str):
 		"""Resolve menu labels when pystray rebuilds the native Windows menu."""
@@ -128,7 +188,7 @@ class TrayController:
 
 	def set_last_update(self, updated_at: datetime):
 		if self._icon:
-			self._icon.title = f"{APP_NAME} - {self._text('last_update')}: {updated_at.strftime('%H:%M:%S')}"
+			self._icon.title = self._title()
 
 	def _safe_call(self, fn: Callable[[], None]):
 		try:
@@ -149,6 +209,8 @@ class TrayController:
 		lang = self._normalize_language(language)
 		def _fn():
 			self.language = lang
+			if self._icon:
+				self._icon.title = self._title()
 			if self.on_set_language:
 				self.on_set_language(lang)
 		return self._action(_fn)
@@ -163,8 +225,9 @@ class TrayController:
 		return lambda item: self.language == language
 
 	def _build_menu(self) -> pystray.Menu:
-		return pystray.Menu(
-			pystray.MenuItem(self._label("force_refresh"), self._action(self.on_force_refresh)),
+		menu = pystray.Menu(
+			pystray.MenuItem(self._label("force_refresh"), self._action(self.on_force_refresh),
+				enabled=lambda item: self.get_status().get("state") != "updating"),
 			pystray.MenuItem(
 				self._label("mode"),
 				pystray.Menu(
@@ -199,6 +262,13 @@ class TrayController:
 				),
 			),
 			pystray.MenuItem(self._label("log_window"), self._action(self.on_toggle_log_window), checked=lambda item: self.is_log_window_open()),
+			pystray.MenuItem(lambda item: self._status_text(), None, enabled=False),
+			pystray.MenuItem(lambda item: f"{self._text('last_update')}: {self._last_update_text()}", None, enabled=False),
+			pystray.MenuItem(self._label("display"), pystray.Menu(*[
+				pystray.MenuItem(self._label(style), self._action(lambda style=style: self.on_set_style(style)),
+					checked=lambda item, style=style: self.get_style() == style, radio=True)
+				for style in ("fit", "fill", "center", "stretch", "tile")
+			])),
 			pystray.MenuItem(
 				self._label("language"),
 				pystray.Menu(
@@ -208,9 +278,21 @@ class TrayController:
 			),
 			pystray.MenuItem(self._label("quit"), self._action(self.on_quit)),
 		)
+		items = list(menu.items)
+		mode_groups = items[1].submenu.items
+		mode_menu = pystray.MenuItem(self._label("mode"), pystray.Menu(
+			*mode_groups[0].submenu.items, pystray.Menu.SEPARATOR, *mode_groups[1].submenu.items))
+		def next_label(item):
+			time = self.get_status().get("next_check")
+			return f"{self._text('next_check')}: {time.strftime('%H:%M:%S')}" if time else self._status_text()
+		return pystray.Menu(items[4], items[5], pystray.MenuItem(next_label, None, enabled=False),
+			pystray.MenuItem(self._label("settings_unsaved"), None, enabled=False,
+				visible=lambda item: self.get_status().get("notice") == "settings_unsaved"),
+			pystray.Menu.SEPARATOR, items[0], mode_menu, items[6], items[2], items[7],
+			pystray.Menu.SEPARATOR, items[3], items[8])
 
 	def run(self):
-		icon = pystray.Icon(APP_NAME, _create_icon(), self._title(), self._build_menu())
+		icon = StatusIcon(APP_NAME, _create_icon(), self._title(), self._build_menu())
 		self._icon = icon
 		log.info("tray starting...")
 		icon.run()

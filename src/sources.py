@@ -11,14 +11,19 @@ import time
 from email.utils import parsedate_to_datetime
 from contextlib import contextmanager
 from urllib.parse import urljoin, urlencode
+from urllib.parse import urlsplit
+import warnings
+from . import image_cache
+from .version import VERSION
 
 import requests
 from requests.adapters import HTTPAdapter
+from urllib3.exceptions import HTTPError as TransportError
 from PIL import Image, ImageChops
 
-Image.MAX_IMAGE_PIXELS = 120_000_000
-USER_AGENT = "HelloPlanet/1.3.0 (+https://gitee.com/yinxiaolong007/hello-planet-earth)"
-TIMEOUT = (8, 20)
+Image.MAX_IMAGE_PIXELS = 32_000_000
+USER_AGENT = f"HelloPlanet/{VERSION} (+https://gitee.com/yinxiaolong007/hello-planet-earth)"
+TIMEOUT = (5, 10)
 MAX_BYTES = 48 * 1024 * 1024
 MAX_SATELLITE_AGE = dt.timedelta(hours=3)
 log = logging.getLogger(__name__)
@@ -34,13 +39,14 @@ class DownloadCancelled(SourceError):
 
 
 @contextmanager
-def download_scope(stop_event):
-    previous = getattr(_local, "stop_event", None)
-    _local.stop_event = stop_event
+def download_scope(stop_event, force=False, progress=None):
+    previous = (getattr(_local, "stop_event", None), getattr(_local, "force", False),
+                getattr(_local, "progress", None))
+    _local.stop_event, _local.force, _local.progress = stop_event, force, progress
     try:
         yield
     finally:
-        _local.stop_event = previous
+        _local.stop_event, _local.force, _local.progress = previous
 
 
 def _check_cancelled():
@@ -53,29 +59,73 @@ def _get_session():
     # Sessions have mutable cookies; give each worker its own reusable pool.
     if not hasattr(_local, "session"):
         session = requests.Session()
+        session.auth = lambda request: request  # Public providers must not inherit netrc credentials.
         session.mount("https://", HTTPAdapter(pool_connections=8, pool_maxsize=8, max_retries=0))
         session.headers.update({"User-Agent": USER_AGENT, "Cache-Control": "no-cache"})
         _local.session = session
     return _local.session
 
 
+def close_session():
+    session = getattr(_local, "session", None)
+    if session is not None:
+        session.close()
+        del _local.session
+
+
 def _request(url, max_bytes=MAX_BYTES):
     _check_cancelled()
     start = time.monotonic()
-    with _get_session().get(url, timeout=TIMEOUT, stream=True) as response:
+    for redirect in range(6):
+        if time.monotonic() - start > 60:
+            raise SourceError("Download exceeded duration limit")
+        _validate_url(url)
+        response = _get_session().get(url, timeout=TIMEOUT, stream=True, allow_redirects=False)
+        if response.status_code not in (301, 302, 303, 307, 308):
+            break
+        location = response.headers.get("Location")
+        response.close()
+        if not location or redirect == 5:
+            raise SourceError("Invalid or excessive redirects")
+        url = urljoin(url, location)
+        _check_cancelled()
+    with response:
         response.raise_for_status()
         if not response.url.startswith("https://"):
             raise SourceError("Provider redirected to an insecure URL")
-        if int(response.headers.get("Content-Length", "0")) > max_bytes:
+        try:
+            length = int(response.headers.get("Content-Length", "0"))
+        except ValueError as error:
+            raise SourceError("Invalid Content-Length") from error
+        if length < 0 or length > max_bytes:
             raise SourceError("Response exceeds download size limit")
         chunks, size = [], 0
-        for chunk in response.iter_content(64 * 1024):
-            _check_cancelled()
-            size += len(chunk)
-            if size > max_bytes or time.monotonic() - start > 60:
-                raise SourceError("Download exceeded size or duration limit")
-            chunks.append(chunk)
-        return b"".join(chunks), dict(response.headers)
+        reader = getattr(response.raw, "read1", None)
+        iterator = iter(lambda: reader(8192, decode_content=True), b"") if reader else response.iter_content(8192)
+        try:
+            for chunk in iterator:
+                _check_cancelled()
+                size += len(chunk)
+                if size > max_bytes or time.monotonic() - start > 60:
+                    raise SourceError("Download exceeded size or duration limit")
+                chunks.append(chunk)
+        except TransportError as error:
+            raise requests.ConnectionError(str(error)) from error
+        return b"".join(chunks), response.headers.copy()
+
+
+def _validate_url(url):
+    allowed = ("nasa.gov", "noaa.gov", "colostate.edu", "nict.go.jp",
+               "kudpc.kyoto-u.ac.jp", "himawari.asia")
+    try:
+        parsed = urlsplit(url)
+        host = (parsed.hostname or "").lower().rstrip(".")
+        if (parsed.scheme != "https" or parsed.username or parsed.password or
+                parsed.port not in (None, 443) or any(ord(char) < 32 for char in url) or
+                not any(host == domain or host.endswith("." + domain) for domain in allowed)):
+            raise SourceError("Image provider URL is not trusted")
+    except ValueError as error:
+        raise SourceError("Invalid provider URL") from error
 
 
 def _json(url):
@@ -104,18 +154,24 @@ def _fresh(timestamp, max_age=MAX_SATELLITE_AGE):
         raise SourceError(f"Stale or invalid observation timestamp: {timestamp.isoformat()}")
 
 
-def _download_image(url, max_retries=2, max_age=None, min_size=1):
+def _download_image(url, max_retries=2, max_age=None, min_size=1, expected_size=None):
     last_error = None
     for attempt in range(max_retries):
         try:
-            body, headers = _request(url)
+            body, headers = _request(url, max_bytes=4 * 1024 * 1024 if expected_size else MAX_BYTES)
             if max_age and headers.get("Last-Modified"):
                 _fresh(parsedate_to_datetime(headers["Last-Modified"]), max_age)
-            with Image.open(io.BytesIO(body)) as original:
-                original.load()
+            with warnings.catch_warnings(), Image.open(io.BytesIO(body), formats=["JPEG", "PNG", "WEBP", "GIF"]) as original:
+                warnings.simplefilter("error", Image.DecompressionBombWarning)
+                if original.width * original.height > Image.MAX_IMAGE_PIXELS:
+                    raise SourceError("Decoded image exceeds pixel limit")
                 if min(original.size) < min_size:
                     raise SourceError(f"Image resolution too small: {original.size}")
+                if expected_size and original.size != expected_size:
+                    raise SourceError(f"Unexpected tile dimensions: {original.size}")
+                original.load()
                 image = original.convert("RGB")
+                image.info.clear()  # Do not retain large remote EXIF/ICC/text payloads in completed futures.
             image.info.update(source_url=url, last_modified=headers.get("Last-Modified"))
             return image
         except requests.HTTPError as error:
@@ -151,7 +207,7 @@ def _best_effort(providers):
 
 HIMAWARI_TILE_SIZE = 550
 HIMAWARI_DEFAULT_TILE_COUNT = 4
-HIMAWARI_ALLOWED_TILE_COUNTS = {1, 2, 4, 8, 16}
+HIMAWARI_ALLOWED_TILE_COUNTS = {1, 2, 4, 8}
 HIMAWARI_SOURCES = [
     ("Kyoto", "https://jh190005-4.kudpc.kyoto-u.ac.jp/himawari/img/D531106/latest.json",
      "https://jh190005-4.kudpc.kyoto-u.ac.jp/himawari/img/D531106/{count}d/550/{y}/{m}/{d}/{h}{mi}{s}_{x}_{tile_y}.png"),
@@ -180,29 +236,49 @@ def _himawari_tile_url(template, timestamp, count, x, y):
 
 
 def _tile_grid(url_for_tile, count, tile_size):
+    if count * count * tile_size * tile_size > Image.MAX_IMAGE_PIXELS:
+        raise SourceError("Tile grid exceeds pixel limit")
+    cache_key = f"{url_for_tile(0, 0)}#{count}:{tile_size}"
+    if not getattr(_local, "force", False):
+        _check_cancelled()
+        cached = image_cache.get(cache_key)
+        if cached is not None:
+            if cached.size == (count * tile_size, count * tile_size):
+                return cached
+            cached.close()
     result = Image.new("RGB", (count * tile_size, count * tile_size))
     futures = {}
+    sessions = []
+    def initialize_worker():
+        sessions.append(_get_session())
     stop_event = getattr(_local, "stop_event", None)
+    progress = getattr(_local, "progress", None)
+    if progress:
+        progress(0, count * count)
     def fetch_tile(url):
         with download_scope(stop_event):
-            return _download_image(url)
+            return _download_image(url, expected_size=(tile_size, tile_size))
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, count * count)) as pool:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, count * count), initializer=initialize_worker) as pool:
             futures = {pool.submit(fetch_tile, url_for_tile(x, y)): (x, y)
                        for y in range(count) for x in range(count)}
-            for future in concurrent.futures.as_completed(futures):
+            for completed, future in enumerate(concurrent.futures.as_completed(futures), 1):
                 x, y = futures[future]
                 try:
                     with future.result() as tile:
                         if tile.size != (tile_size, tile_size):
                             raise SourceError(f"Unexpected tile size: {tile.size}")
                         result.paste(tile, (x * tile_size, y * tile_size))
+                    if progress:
+                        progress(completed, count * count)
                 except Exception as error:
                     for pending in futures:
                         pending.cancel()
                     if isinstance(error, DownloadCancelled):
                         raise
                     raise SourceError(f"Incomplete tile grid at ({x},{y}): {error}") from error
+        _check_cancelled()
+        image_cache.put(cache_key, result)
         return result
     except BaseException:
         result.close()
@@ -210,6 +286,9 @@ def _tile_grid(url_for_tile, count, tile_size):
             if future.done() and not future.cancelled() and future.exception() is None:
                 future.result().close()
         raise
+    finally:
+        for session in sessions:
+            session.close()
 
 
 def _fetch_himawari_source(source, count):
@@ -233,7 +312,7 @@ SLIDER_TILE_SIZES = {"himawari": 688, "gk2a": 688, "goes-19": 678, "goes-18": 67
 
 
 def fetch_slider_latest(satellite="himawari", count=4):
-    if count not in {1, 2, 4, 8, 16}:
+    if count not in {1, 2, 4, 8}:
         raise SourceError("Unsupported CIRA tile count")
     times = _json(f"{SLIDER_BASE}json/{satellite}/full_disk/geocolor/latest_times.json").get("timestamps_int", [])
     if not times:
@@ -314,16 +393,17 @@ APOD_API = "https://science.nasa.gov/wp-json/wp/v2/apod-basic"
 def fetch_apod_image():
     today = dt.datetime.now(dt.timezone.utc).date()
     params = {"start_date": (today - dt.timedelta(days=7)).isoformat(), "end_date": today.isoformat()}
-    data = _json(APOD_API + "?" + urlencode(params))
-    if isinstance(data, dict):
-        data = [data]
-    for item in sorted(data, key=lambda item: item.get("date", ""), reverse=True):
-        # New API's url points to an HTML article; download hdurl.
-        if item.get("media_type") == "image" and item.get("hdurl"):
-            url = item["hdurl"]
-            image = _download_image(url, min_size=400)
-            image.info["published_date"] = item["date"]
-            return image, url
+    for api in (APOD_API, APOD_API + "?" + urlencode(params)):
+        data = _json(api)
+        if isinstance(data, dict):
+            data = [data]
+        for item in sorted(data, key=lambda item: item.get("date", ""), reverse=True):
+            # New API's url points to an HTML article; download hdurl.
+            if item.get("media_type") == "image" and item.get("hdurl"):
+                url = item["hdurl"]
+                image = _download_image(url, min_size=400)
+                image.info["published_date"] = item["date"]
+                return image, url
     raise SourceError("No APOD image available in the last seven days")
 
 
@@ -358,8 +438,8 @@ MARS_GALLERY_API = "https://science.nasa.gov/wp-json/wp/v2/image-article"
 
 def fetch_mars_best_effort():
     # This is a curated gallery, not a real-time rover downlink.
-    params = {"search": "Curiosity", "per_page": 10, "_embed": "true"}
-    data = _json(MARS_GALLERY_API + "?" + urlencode(params))
+    params = {"search": "Curiosity", "per_page": 3}
+    data = _json(MARS_GALLERY_API + "?" + urlencode(params) + "&_embed")
     for post in sorted(data, key=lambda item: item.get("date", ""), reverse=True):
         for media in post.get("_embedded", {}).get("wp:featuredmedia", []):
             alt = media.get("alt_text", "").lower()

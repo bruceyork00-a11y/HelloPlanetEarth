@@ -5,7 +5,8 @@ import sys
 import time
 import threading
 import logging
-from datetime import datetime
+import atexit
+from datetime import datetime, timedelta
 from typing import Callable, Optional, Tuple
 
 from PIL import Image
@@ -23,12 +24,15 @@ from .sources import (
 	fetch_epic_latest,
 	fetch_worldview_asia_latest,
 	download_scope,
+	DownloadCancelled,
+	close_session,
 )
 from .wallpaper import set_wallpaper_from_image
 from .cache import read_last, write_last, md5_of_image
 from .logging_setup import setup_logging, get_log_path, install_crash_handler
-from .config import load_config, save_config, resolve
+from .config import load_config, save_config, resolve, validate
 from .tray import TrayController
+from .version import VERSION
 
 
 log = logging.getLogger(__name__)
@@ -75,8 +79,9 @@ def _fetcher(mode: str) -> Callable[[], Tuple[Image.Image, str]]:
 class Runner:
 	def __init__(self, mode: str, interval_seconds: int, style: str, on_updated: Optional[Callable[[datetime], None]] = None):
 		self.mode = mode
-		self.interval_seconds = interval_seconds
-		self.style = style
+		self.mode = validate(mode, "mode")
+		self.interval_seconds = validate(interval_seconds, "interval")
+		self.style = validate(style, "style")
 		self.on_updated = on_updated
 		self.last_update_time: Optional[datetime] = None
 		self._stop = threading.Event()
@@ -84,19 +89,60 @@ class Runner:
 		self._lock = threading.RLock()
 		self._tick_lock = threading.Lock()
 		self._force_refresh_requested = False
+		self._bypass_cache_requested = False
+		self._download_cancel = threading.Event()
+		self._last_applied = None
+		self._failures = 0
+		self.on_status_changed = None
+		self._status = {"state": "idle", "progress": None, "last_checked": None,
+			"next_check": None, "resolution": None, "notice": None}
+		self._last_progress = 0.0
 		self._mode_version = 0
 		self._thread = None
 
-	def _tick_once(self, force: bool = False) -> None:
+	def get_status(self):
+		with self._lock:
+			return dict(self._status)
+
+	def _publish(self, state=None, version=None, **changes):
+		with self._lock:
+			if version is not None and version != self._mode_version:
+				return
+			if state:
+				self._status["state"] = state
+			self._status.update(changes)
+			snapshot = dict(self._status)
+		if self.on_status_changed:
+			try:
+				self.on_status_changed(snapshot)
+			except Exception:
+				log.debug("status callback failed", exc_info=True)
+
+	def _progress(self, version, completed, total):
+		with self._lock:
+			if version != self._mode_version or self._stop.is_set():
+				return
+			now = time.monotonic()
+			if completed != total and now - self._last_progress < 0.25:
+				return
+			self._last_progress = now
+		self._publish(version=version, progress=(completed, total))
+
+	def _tick_once(self, force: bool = False, bypass_cache=None) -> None:
 		with self._tick_lock:
 			with self._lock:
 				mode = self.mode
 				style = self.style
 				mode_version = self._mode_version
+				cancel = self._download_cancel
+				if self._stop.is_set():
+					return
+			self._publish("updating", version=mode_version, progress=None, next_check=None)
 			fetch = _fetcher(mode)
 			img = None
 			try:
-				with download_scope(self._stop):
+				with download_scope(cancel, force=force if bypass_cache is None else bypass_cache,
+					progress=lambda done, total: self._progress(mode_version, done, total)):
 					img, url = fetch()
 				hashv = md5_of_image(img)
 				last_url, last_hash = read_last()
@@ -106,16 +152,35 @@ class Runner:
 					if self._stop.is_set() or mode_version != self._mode_version:
 						log.info(f"tick: discard stale result for mode={mode}")
 						return
-					if not force and last_url == url and last_hash == hashv:
-						log.info("tick: skip same image (url+hash)")
+					skip = not force and last_url == url and last_hash == hashv and self._last_applied == (mode, style)
+				if skip:
+					self._failures = 0
+					self._publish("unchanged", version=mode_version, last_checked=datetime.now(), progress=None)
+					return
+				# Native wallpaper I/O must not hold the lock needed by tray actions.
+				set_wallpaper_from_image(img, style=style)
+				write_last(url, hashv)
+				updated_at = datetime.now()
+				with self._lock:
+					if self._stop.is_set() or mode_version != self._mode_version:
 						return
-					set_wallpaper_from_image(img, style=style)
-					write_last(url, hashv)
-					updated_at = datetime.now()
 					self.last_update_time = updated_at
+					self._last_applied = (mode, style)
+					self._failures = 0
 				if self.on_updated:
 					self.on_updated(updated_at)
 				log.info("tick: wallpaper updated")
+				self._publish("updated", version=mode_version, last_checked=updated_at, progress=None, resolution=img.size)
+			except DownloadCancelled:
+				log.info("obsolete or stopped download cancelled")
+			except Exception:
+				with self._lock:
+					current = mode_version == self._mode_version and not self._stop.is_set()
+					if current:
+						self._failures += 1
+				if current:
+					self._publish("error", version=mode_version, progress=None, last_checked=datetime.now())
+				raise
 			finally:
 				if img is not None:
 					img.close()
@@ -129,13 +194,15 @@ class Runner:
 				interval_seconds = self.interval_seconds
 				force = self._force_refresh_requested
 				self._force_refresh_requested = False
+				bypass = self._bypass_cache_requested
+				self._bypass_cache_requested = False
 			# Detect a long gap (machine slept/woken): the wallpaper is now stale.
 			now = time.monotonic()
 			if now - last_start > interval_seconds + 300:
 				log.info("loop: long gap (sleep/wake?) detected, forcing refresh")
 				force = True
 			try:
-				self._tick_once(force=force)
+				self._tick_once(force=force, bypass_cache=bypass)
 			except Exception as e:
 				log.error(f"runner error: {e}")
 			last_start = time.monotonic()
@@ -143,39 +210,79 @@ class Runner:
 				break
 			with self._lock:
 				interval_seconds = self.interval_seconds
+				interval_seconds = min(interval_seconds * (2 ** min(max(self._failures - 1, 0), 4)), max(3600, interval_seconds))
+			self._publish(next_check=datetime.now() + timedelta(seconds=interval_seconds))
 			self._wakeup.wait(interval_seconds)
 		log.info("runner stopped")
+		close_session()
 
 	def start(self):
-		self._thread = threading.Thread(target=self.loop, daemon=True)
-		self._thread.start()
+		with self._lock:
+			if self._stop.is_set() or (self._thread and self._thread.is_alive()):
+				return
+			self._thread = threading.Thread(target=self.loop, daemon=True)
+			self._thread.start()
 
-	def stop(self):
-		self._stop.set()
-		self._wakeup.set()
-		if self._thread:
+	def stop(self, wait=True):
+		with self._lock:
+			self._stop.set()
+			self._download_cancel.set()
+			self._wakeup.set()
+		if wait and self._thread and self._thread is not threading.current_thread():
 			self._thread.join(timeout=3)
 
 	def force_refresh_now(self):
 		"""Schedule a cache-bypassing refresh without blocking the tray UI."""
 		with self._lock:
+			if self._status["state"] == "updating" or self._stop.is_set():
+				return False
 			self._force_refresh_requested = True
+			self._bypass_cache_requested = True
 			self._wakeup.set()
 		log.info("force refresh requested")
+		return True
 
 	def switch_mode(self, new_mode: str):
+		new_mode = validate(new_mode, "mode")
 		with self._lock:
+			if self.mode == new_mode:
+				return
 			log.info(f"switch mode: {self.mode} -> {new_mode}")
 			self.mode = new_mode
 			self._mode_version += 1
+			self._download_cancel.set()
+			self._download_cancel = threading.Event()
+			self._failures = 0
 			self._force_refresh_requested = True
+			self._status.update(state="updating", progress=None, next_check=None)
 			self._wakeup.set()
 		log.info(f"mode refresh requested: {new_mode}")
+		self._publish()
+
+	def set_style(self, style):
+		style = validate(style, "style")
+		with self._lock:
+			if style == self.style:
+				return
+			self.style = style
+			self._mode_version += 1
+			self._download_cancel.set()
+			self._download_cancel = threading.Event()
+			self._force_refresh_requested = True
+			self._status.update(state="updating", progress=None, next_check=None)
+			self._wakeup.set()
+		self._publish()
+
+	def get_style(self):
+		with self._lock:
+			return self.style
 
 	def set_interval(self, interval_seconds: int):
+		interval_seconds = validate(interval_seconds, "interval")
 		with self._lock:
 			log.info(f"switch interval: {self.interval_seconds}s -> {interval_seconds}s")
 			self.interval_seconds = interval_seconds
+			# Wake promptly to recompute the schedule after a setting change.
 			self._wakeup.set()
 
 	def get_mode(self) -> str:
@@ -201,9 +308,13 @@ def run_with_tray(mode: str, interval_seconds: int, style: str) -> None:
 	setup_logging(os.getenv("LOG_LEVEL", "INFO"), enable_console=False)
 	log.info(f"{APP_NAME} starting...")
 	cfg = load_config()
+	cfg.update(mode=mode, interval=interval_seconds, style=style)
 	# On first run (no saved config), still honor the HELLOPLANET_LANG env var.
-	initial_language = cfg.get("language") if cfg.get("_loaded") else None
+	initial_language = cfg.get("language") if "language" in cfg.get("_valid_keys", []) else None
 	log_window_process: Optional[subprocess.Popen] = None
+
+	def persist():
+		runner._publish(notice=None if save_config(cfg) else "settings_unsaved")
 
 	def on_force_refresh():
 		runner.force_refresh_now()
@@ -211,16 +322,21 @@ def run_with_tray(mode: str, interval_seconds: int, style: str) -> None:
 	def on_switch(new_mode: str):
 		runner.switch_mode(new_mode)
 		cfg["mode"] = new_mode
-		save_config(cfg)
+		persist()
+
+	def on_set_style(style):
+		runner.set_style(style)
+		cfg["style"] = style
+		persist()
 
 	def on_set_interval(interval: int):
 		runner.set_interval(interval)
 		cfg["interval"] = interval
-		save_config(cfg)
+		persist()
 
 	def on_set_language(language: str):
 		cfg["language"] = language
-		save_config(cfg)
+		persist()
 
 	def is_log_window_open() -> bool:
 		nonlocal log_window_process
@@ -238,13 +354,14 @@ def run_with_tray(mode: str, interval_seconds: int, style: str) -> None:
 			log_window_process.terminate()
 			log_window_process = None
 			return
-		log_window_process = subprocess.Popen(["notepad.exe", path])
+		notepad = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "notepad.exe")
+		log_window_process = subprocess.Popen([notepad, path])
 
 	def on_quit():
 		log.info("quit requested")
 		if is_log_window_open():
 			log_window_process.terminate()
-		runner.stop()
+		runner.stop(wait=False)
 		tray.stop()
 
 	runner = Runner(mode, interval_seconds, style)
@@ -260,20 +377,33 @@ def run_with_tray(mode: str, interval_seconds: int, style: str) -> None:
 		get_mode=runner.get_mode,
 		get_interval=runner.get_interval,
 		get_last_update_time=runner.get_last_update_time,
+		get_status=runner.get_status,
+		on_set_style=on_set_style,
+		get_style=runner.get_style,
 	)
 	runner.on_updated = tray.set_last_update
+	runner.on_status_changed = tray.set_status
 	runner.start()
-	tray.run()
+	try:
+		tray.run()
+	finally:
+		runner.stop()
 
 
 def parse_args(argv: list) -> argparse.Namespace:
 	parser = argparse.ArgumentParser(description="HelloPlanet realtime wallpaper")
+	parser.add_argument("--version", action="version", version=f"HelloPlanet {VERSION}")
 	parser.add_argument(
 		"--mode",
 		choices=["earth", "goes_west", "asia", "asia_2k", "asia_4k", "asia_custom", "asia_gk2a", "asia_modis", "earth_epic", "sky", "sun_sdo", "mars"],
 		default=None,
 	)
-	parser.add_argument("--interval", type=int, default=None)
+	def interval_arg(value):
+		try:
+			return validate(value, "interval")
+		except ValueError as error:
+			raise argparse.ArgumentTypeError(str(error)) from error
+	parser.add_argument("--interval", type=interval_arg, default=None)
 	parser.add_argument("--style", choices=["center", "stretch", "fit", "fill", "tile"], default=None)
 	parser.add_argument("--no-tray", action="store_true", help="禁用系统托盘，仅控制台运行")
 	parser.add_argument("--log-level", default=os.getenv("LOG_LEVEL", "INFO"))
@@ -288,19 +418,27 @@ def _ensure_single_instance() -> bool:
 		return True
 	try:
 		import ctypes
-		kernel32 = ctypes.windll.kernel32
+		from ctypes import wintypes
+		kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+		kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+		kernel32.CreateMutexW.restype = wintypes.HANDLE
+		kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+		kernel32.CloseHandle.restype = wintypes.BOOL
 		user = os.getenv("USERNAME", "default")
 		name = "Local\\HelloPlanet_Instance_" + "".join(c if c.isalnum() else "_" for c in user)
 		handle = kernel32.CreateMutexW(None, False, name)
 		if not handle:
-			return True
+			raise ctypes.WinError(ctypes.get_last_error())
 		_INSTANCE_MUTEX = handle
-		if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+		if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+			kernel32.CloseHandle(handle)
+			_INSTANCE_MUTEX = None
 			return False
+		atexit.register(kernel32.CloseHandle, handle)
 		return True
 	except Exception as e:
-		log.warning(f"single-instance check failed (proceeding): {e}")
-		return True
+		log.error(f"single-instance check failed: {e}")
+		return False
 
 
 def main(argv: list) -> int:
